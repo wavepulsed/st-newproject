@@ -1,0 +1,83 @@
+/* Img2Img Reference Generator — styles */
+
+#img2img_settings {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    padding-bottom: 12px;
+}
+
+#img2img_settings h4 {
+    margin: 0 0 4px 0;
+}
+
+#img2img_settings hr {
+    border-color: rgba(255,255,255,0.1);
+    margin: 8px 0;
+}
+
+.img2img_section_label {
+    font-size: 0.85em;
+    opacity: 0.7;
+    margin-bottom: 4px;
+}
+
+#img2img_gallery {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    min-height: 40px;
+}
+
+.img2img_thumb {
+    position: relative;
+    width: 80px;
+    height: 80px;
+}
+
+.img2img_thumb img {
+    width: 80px;
+    height: 80px;
+    object-fit: cover;
+    border-radius: 6px;
+    border: 1px solid rgba(255,255,255,0.15);
+}
+
+.img2img_delete_btn {
+    position: absolute;
+    top: -6px;
+    right: -6px;
+    width: 20px;
+    height: 20px;
+    border-radius: 50%;
+    background: #c0392b;
+    color: white;
+    border: none;
+    cursor: pointer;
+    font-size: 10px;
+    line-height: 20px;
+    text-align: center;
+    padding: 0;
+}
+
+.img2img_empty {
+    font-size: 0.8em;
+    opacity: 0.5;
+    font-style: italic;
+}
+
+.img2img_upload_btn {
+    display: inline-block;
+    padding: 6px 12px;
+    background: rgba(255,255,255,0.08);
+    border: 1px dashed rgba(255,255,255,0.25);
+    border-radius: 6px;
+    cursor: pointer;
+    text-align: center;
+    font-size: 0.9em;
+    transition: background 0.2s;
+}
+
+.img2img_upload_btn:hover {
+    background: rgba(255,255,255,0.15);
+}

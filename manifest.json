@@ -1,0 +1,12 @@
+{
+    "display_name": "Img2Img Reference Generator",
+    "loading_order": 10,
+    "requires": [],
+    "optional": [],
+    "js": "index.js",
+    "css": "style.css",
+    "author": "wavepulsed",
+    "version": "0.1.0",
+    "homePage": "https://github.com/wavepulsed/st-newproject",
+    "description": "Generate images using reference photos from per-character galleries via Seedream 4.5."
+}

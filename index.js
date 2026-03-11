@@ -1,5 +1,5 @@
 // Img2Img Reference Generator for SillyTavern
-// Version 0.4.0 — API Integration + Chat Injection
+// Version 0.4.1 — Editable Model ID field
 
 import { extension_settings, getContext } from "../../../extensions.js";
 import { saveSettingsDebounced, eventSource, event_types } from "../../../../script.js";
@@ -90,6 +90,7 @@ async function generateImage(prompt) {
 
     console.log(`[Img2Img] Generating image for prompt: "${prompt}"`);
     console.log(`[Img2Img] Using ${referenceImages.length} reference image(s)`);
+    console.log(`[Img2Img] Model: ${settings.model}`);
 
     const payload = {
         model: settings.model,
@@ -99,7 +100,6 @@ async function generateImage(prompt) {
         response_format: "url",
     };
 
-    // Attach reference images if we have any
     if (referenceImages.length === 1) {
         payload.imageDataUrl = referenceImages[0];
     } else if (referenceImages.length > 1) {
@@ -123,7 +123,6 @@ async function generateImage(prompt) {
     const data = await response.json();
     console.log("[Img2Img] API response received:", data);
 
-    // The URL to the generated image
     const imageUrl = data?.data?.[0]?.url;
     if (!imageUrl) {
         throw new Error("API returned no image URL. Full response: " + JSON.stringify(data));
@@ -136,8 +135,6 @@ async function generateImage(prompt) {
 
 function injectImageIntoChat(imageUrl, prompt) {
     const context = getContext();
-
-    // Build a message that shows the image and the prompt used
     const messageHtml = `
         <div class="img2img_result">
             <img src="${imageUrl}"
@@ -148,8 +145,6 @@ function injectImageIntoChat(imageUrl, prompt) {
             <div class="img2img_prompt_label">🖼️ ${prompt}</div>
         </div>
     `;
-
-    // Send as a narrator-style message so it sits cleanly in chat
     context.sendNarratorMessage(messageHtml);
 }
 
@@ -279,6 +274,14 @@ function renderSettingsPanel() {
                    value="${settings.api_key}" />
             <small>Your key is stored locally and never shared.</small>
 
+            <label style="margin-top:8px;">Model ID</label>
+            <input type="text"
+                   id="img2img_model"
+                   class="text_pole"
+                   placeholder="e.g. seedream-v4.5"
+                   value="${settings.model}" />
+            <small>Check your provider's model list for the exact ID string.</small>
+
             <label style="margin-top:8px;">Image Size</label>
             <select id="img2img_size" class="text_pole">
                 <option value="1024x1024" ${settings.image_size === "1024x1024" ? "selected" : ""}>1024×1024 (Square)</option>
@@ -313,6 +316,11 @@ function renderSettingsPanel() {
         saveSettingsDebounced();
     });
 
+    $("#img2img_model").on("input", function () {
+        getSettings().model = $(this).val();
+        saveSettingsDebounced();
+    });
+
     $("#img2img_size").on("change", function () {
         getSettings().image_size = $(this).val();
         saveSettingsDebounced();
@@ -341,7 +349,6 @@ jQuery(async () => {
     renderSettingsPanel();
     registerEvents();
 
-    // Register the slash command
     registerSlashCommand(
         "img2img",
         handleGenerateCommand,

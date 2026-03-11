@@ -2,7 +2,7 @@
 // Version 0.4.1 — Editable Model ID field
 
 import { extension_settings, getContext } from "../../../extensions.js";
-import { saveSettingsDebounced, eventSource, event_types } from "../../../../script.js";
+import { saveSettingsDebounced, eventSource, event_types, sendNarratorMessage } from "../../../../script.js";
 import { registerSlashCommand } from "../../../slash-commands.js";
 
 const extensionName = "st-img2img";
@@ -134,18 +134,11 @@ async function generateImage(prompt) {
 // ── Chat injection ────────────────────────────────────────────────────────────
 
 function injectImageIntoChat(imageUrl, prompt) {
-    const context = getContext();
-    const messageHtml = `
-        <div class="img2img_result">
-            <img src="${imageUrl}"
-                 alt="${prompt}"
-                 style="max-width:100%; border-radius:8px; cursor:pointer;"
-                 onclick="window.open('${imageUrl}', '_blank')"
-                 title="Click to open full size" />
-            <div class="img2img_prompt_label">🖼️ ${prompt}</div>
-        </div>
-    `;
-    context.sendNarratorMessage(messageHtml);
+    const messageHtml = `<div class="img2img_result">
+<img src="${imageUrl}" alt="${prompt}" style="max-width:100%; border-radius:8px; cursor:pointer;" onclick="window.open('${imageUrl}', '_blank')" title="Click to open full size" />
+<div class="img2img_prompt_label">🖼️ ${prompt}</div>
+</div>`;
+    sendNarratorMessage(messageHtml);
 }
 
 // ── Loading indicator ─────────────────────────────────────────────────────────

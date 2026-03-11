@@ -171,8 +171,8 @@ function hideLoadingMessage() {
 
 // ── Main trigger ──────────────────────────────────────────────────────────────
 
-async function handleGenerateCommand(args) {
-    const prompt = typeof args === "string" ? args : args?.value || args?.[0] || "";
+async function handleGenerateCommand(namedArgs, unnamedValue) {
+    const prompt = unnamedValue || namedArgs?.value || "";
 
     if (!prompt.trim()) {
         toastr.warning("Please provide a prompt. Usage: /img2img a girl in a forest");

@@ -1,17 +1,68 @@
 // Img2Img Reference Generator for SillyTavern
-// Version 0.2.0 — Gallery System
+// Version 0.3.0 — IndexedDB Gallery Storage
 
 import { extension_settings, getContext } from "../../../extensions.js";
 import { saveSettingsDebounced, eventSource, event_types } from "../../../../script.js";
 
 const extensionName = "st-img2img";
+const DB_NAME = "img2img_gallery_db";
+const DB_VERSION = 1;
+const STORE_NAME = "galleries";
+
+// ── IndexedDB setup ───────────────────────────────────────────────────────────
+
+let db = null;
+
+function openDatabase() {
+    return new Promise((resolve, reject) => {
+        const request = indexedDB.open(DB_NAME, DB_VERSION);
+
+        request.onupgradeneeded = (e) => {
+            const database = e.target.result;
+            if (!database.objectStoreNames.contains(STORE_NAME)) {
+                database.createObjectStore(STORE_NAME, { keyPath: "characterName" });
+            }
+        };
+
+        request.onsuccess = (e) => {
+            db = e.target.result;
+            console.log("[Img2Img] IndexedDB opened successfully.");
+            resolve(db);
+        };
+
+        request.onerror = (e) => {
+            console.error("[Img2Img] IndexedDB error:", e.target.error);
+            reject(e.target.error);
+        };
+    });
+}
+
+function saveGalleryToDB(characterName, images) {
+    return new Promise((resolve, reject) => {
+        const tx = db.transaction(STORE_NAME, "readwrite");
+        const store = tx.objectStore(STORE_NAME);
+        const request = store.put({ characterName, images });
+        request.onsuccess = () => resolve();
+        request.onerror = (e) => reject(e.target.error);
+    });
+}
+
+function loadGalleryFromDB(characterName) {
+    return new Promise((resolve, reject) => {
+        const tx = db.transaction(STORE_NAME, "readonly");
+        const store = tx.objectStore(STORE_NAME);
+        const request = store.get(characterName);
+        request.onsuccess = (e) => resolve(e.target.result?.images || []);
+        request.onerror = (e) => reject(e.target.error);
+    });
+}
+
+// ── Settings ──────────────────────────────────────────────────────────────────
+
 const defaultSettings = {
     api_key: "",
     model: "seedream-4-5",
-    galleries: {}, // { "CharacterName": [ "data:image/png;base64,..." ] }
 };
-
-// ── Settings helpers ──────────────────────────────────────────────────────────
 
 function loadSettings() {
     extension_settings[extensionName] = extension_settings[extensionName] || {};
@@ -19,9 +70,6 @@ function loadSettings() {
         ...defaultSettings,
         ...extension_settings[extensionName],
     };
-    // Make sure galleries key always exists
-    extension_settings[extensionName].galleries =
-        extension_settings[extensionName].galleries || {};
 }
 
 function getSettings() {
@@ -35,18 +83,9 @@ function getCurrentCharacterName() {
     return context?.name2 || null;
 }
 
-function getGalleryForCharacter(name) {
-    return getSettings().galleries[name] || [];
-}
-
-function saveGalleryForCharacter(name, images) {
-    getSettings().galleries[name] = images;
-    saveSettingsDebounced();
-}
-
 // ── Gallery UI ────────────────────────────────────────────────────────────────
 
-function renderGallery() {
+async function renderGallery() {
     const charName = getCurrentCharacterName();
     const $gallery = $("#img2img_gallery");
     const $label = $("#img2img_gallery_label");
@@ -59,10 +98,13 @@ function renderGallery() {
     }
 
     $label.text(`Reference images for: ${charName}`);
-    const images = getGalleryForCharacter(charName);
+
+    const images = await loadGalleryFromDB(charName);
+    console.log(`[Img2Img] Rendering gallery for "${charName}" — ${images.length} image(s)`);
 
     if (images.length === 0) {
         $gallery.append(`<p class="img2img_empty">No reference images yet. Upload some below!</p>`);
+        return;
     }
 
     images.forEach((dataUrl, index) => {
@@ -75,42 +117,49 @@ function renderGallery() {
         $gallery.append($thumb);
     });
 
-    // Delete button handler
-    $(".img2img_delete_btn").on("click", function () {
+    $(".img2img_delete_btn").on("click", async function () {
         const index = parseInt($(this).data("index"));
-        const updated = getGalleryForCharacter(charName);
-        updated.splice(index, 1);
-        saveGalleryForCharacter(charName, updated);
+        const images = await loadGalleryFromDB(charName);
+        images.splice(index, 1);
+        await saveGalleryToDB(charName, images);
         renderGallery();
     });
 }
 
 // ── File upload ───────────────────────────────────────────────────────────────
 
-function handleImageUpload(files) {
+async function handleImageUpload(files) {
     const charName = getCurrentCharacterName();
+    console.log("[Img2Img] Upload triggered. Character:", charName);
+
     if (!charName) {
         alert("Please open a character chat before uploading reference images.");
         return;
     }
 
-    const current = getGalleryForCharacter(charName);
-    let loaded = 0;
+    const current = await loadGalleryFromDB(charName);
+    console.log("[Img2Img] Existing images in gallery:", current.length);
 
-    Array.from(files).forEach((file) => {
-        if (!file.type.startsWith("image/")) return;
-
+    const readFile = (file) => new Promise((resolve, reject) => {
         const reader = new FileReader();
-        reader.onload = (e) => {
-            current.push(e.target.result);
-            loaded++;
-            if (loaded === files.length) {
-                saveGalleryForCharacter(charName, current);
-                renderGallery();
-            }
-        };
+        reader.onload = (e) => resolve(e.target.result);
+        reader.onerror = (e) => reject(e);
         reader.readAsDataURL(file);
     });
+
+    for (const file of Array.from(files)) {
+        if (!file.type.startsWith("image/")) {
+            console.log("[Img2Img] Skipped non-image:", file.name);
+            continue;
+        }
+        const dataUrl = await readFile(file);
+        current.push(dataUrl);
+        console.log("[Img2Img] Added:", file.name);
+    }
+
+    await saveGalleryToDB(charName, current);
+    console.log("[Img2Img] Gallery saved. Total images:", current.length);
+    renderGallery();
 }
 
 // ── Settings panel ────────────────────────────────────────────────────────────
@@ -148,24 +197,21 @@ function renderSettingsPanel() {
     `;
     $("#extensions_settings").append(html);
 
-    // API key save
     $("#img2img_api_key").on("input", function () {
         getSettings().api_key = $(this).val();
         saveSettingsDebounced();
     });
 
-    // File picker
     $("#img2img_upload_input").on("change", function () {
         handleImageUpload(this.files);
-        this.value = ""; // reset so same file can be re-added
+        this.value = "";
     });
 
     renderGallery();
 }
 
-// ── Event listeners ───────────────────────────────────────────────────────────
+// ── Events ────────────────────────────────────────────────────────────────────
 
-// Re-render gallery whenever the user switches character/chat
 function registerEvents() {
     eventSource.on(event_types.CHAT_CHANGED, () => {
         renderGallery();
@@ -175,8 +221,9 @@ function registerEvents() {
 // ── Entry point ───────────────────────────────────────────────────────────────
 
 jQuery(async () => {
+    await openDatabase();
     loadSettings();
     renderSettingsPanel();
     registerEvents();
-    console.log("[Img2Img] Extension loaded — gallery system active.");
+    console.log("[Img2Img] Extension ready.");
 });

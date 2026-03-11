@@ -1,39 +1,31 @@
 // Img2Img Reference Generator for SillyTavern
-// Version 0.3.0 — IndexedDB Gallery Storage
+// Version 0.4.0 — API Integration + Chat Injection
 
 import { extension_settings, getContext } from "../../../extensions.js";
 import { saveSettingsDebounced, eventSource, event_types } from "../../../../script.js";
+import { registerSlashCommand } from "../../../slash-commands.js";
 
 const extensionName = "st-img2img";
+const NANO_API_URL = "https://nano-gpt.com/api/v1/images/generations";
 const DB_NAME = "img2img_gallery_db";
 const DB_VERSION = 1;
 const STORE_NAME = "galleries";
 
-// ── IndexedDB setup ───────────────────────────────────────────────────────────
+// ── IndexedDB ─────────────────────────────────────────────────────────────────
 
 let db = null;
 
 function openDatabase() {
     return new Promise((resolve, reject) => {
         const request = indexedDB.open(DB_NAME, DB_VERSION);
-
         request.onupgradeneeded = (e) => {
             const database = e.target.result;
             if (!database.objectStoreNames.contains(STORE_NAME)) {
                 database.createObjectStore(STORE_NAME, { keyPath: "characterName" });
             }
         };
-
-        request.onsuccess = (e) => {
-            db = e.target.result;
-            console.log("[Img2Img] IndexedDB opened successfully.");
-            resolve(db);
-        };
-
-        request.onerror = (e) => {
-            console.error("[Img2Img] IndexedDB error:", e.target.error);
-            reject(e.target.error);
-        };
+        request.onsuccess = (e) => { db = e.target.result; resolve(db); };
+        request.onerror = (e) => reject(e.target.error);
     });
 }
 
@@ -62,6 +54,7 @@ function loadGalleryFromDB(characterName) {
 const defaultSettings = {
     api_key: "",
     model: "seedream-4-5",
+    image_size: "1024x1024",
 };
 
 function loadSettings() {
@@ -83,6 +76,122 @@ function getCurrentCharacterName() {
     return context?.name2 || null;
 }
 
+// ── API call ──────────────────────────────────────────────────────────────────
+
+async function generateImage(prompt) {
+    const settings = getSettings();
+
+    if (!settings.api_key) {
+        throw new Error("No API key set. Please add your NanoGPT key in the extension settings.");
+    }
+
+    const charName = getCurrentCharacterName();
+    const referenceImages = charName ? await loadGalleryFromDB(charName) : [];
+
+    console.log(`[Img2Img] Generating image for prompt: "${prompt}"`);
+    console.log(`[Img2Img] Using ${referenceImages.length} reference image(s)`);
+
+    const payload = {
+        model: settings.model,
+        prompt: prompt,
+        n: 1,
+        size: settings.image_size,
+        response_format: "url",
+    };
+
+    // Attach reference images if we have any
+    if (referenceImages.length === 1) {
+        payload.imageDataUrl = referenceImages[0];
+    } else if (referenceImages.length > 1) {
+        payload.imageDataUrls = referenceImages;
+    }
+
+    const response = await fetch(NANO_API_URL, {
+        method: "POST",
+        headers: {
+            "Authorization": `Bearer ${settings.api_key}`,
+            "Content-Type": "application/json",
+        },
+        body: JSON.stringify(payload),
+    });
+
+    if (!response.ok) {
+        const errorText = await response.text();
+        throw new Error(`NanoGPT API error ${response.status}: ${errorText}`);
+    }
+
+    const data = await response.json();
+    console.log("[Img2Img] API response received:", data);
+
+    // The URL to the generated image
+    const imageUrl = data?.data?.[0]?.url;
+    if (!imageUrl) {
+        throw new Error("API returned no image URL. Full response: " + JSON.stringify(data));
+    }
+
+    return imageUrl;
+}
+
+// ── Chat injection ────────────────────────────────────────────────────────────
+
+function injectImageIntoChat(imageUrl, prompt) {
+    const context = getContext();
+
+    // Build a message that shows the image and the prompt used
+    const messageHtml = `
+        <div class="img2img_result">
+            <img src="${imageUrl}"
+                 alt="${prompt}"
+                 style="max-width:100%; border-radius:8px; cursor:pointer;"
+                 onclick="window.open('${imageUrl}', '_blank')"
+                 title="Click to open full size" />
+            <div class="img2img_prompt_label">🖼️ ${prompt}</div>
+        </div>
+    `;
+
+    // Send as a narrator-style message so it sits cleanly in chat
+    context.sendNarratorMessage(messageHtml);
+}
+
+// ── Loading indicator ─────────────────────────────────────────────────────────
+
+function showLoadingMessage() {
+    const $loading = $(`
+        <div id="img2img_loading" class="img2img_loading_msg">
+            ⏳ Generating image, please wait...
+        </div>
+    `);
+    $("#chat").append($loading);
+    $("#chat").scrollTop($("#chat")[0].scrollHeight);
+}
+
+function hideLoadingMessage() {
+    $("#img2img_loading").remove();
+}
+
+// ── Main trigger ──────────────────────────────────────────────────────────────
+
+async function handleGenerateCommand(args) {
+    const prompt = typeof args === "string" ? args : args?.value || args?.[0] || "";
+
+    if (!prompt.trim()) {
+        toastr.warning("Please provide a prompt. Usage: /img2img a girl in a forest");
+        return;
+    }
+
+    showLoadingMessage();
+
+    try {
+        const imageUrl = await generateImage(prompt.trim());
+        hideLoadingMessage();
+        injectImageIntoChat(imageUrl, prompt.trim());
+    } catch (err) {
+        hideLoadingMessage();
+        console.error("[Img2Img] Generation failed:", err);
+        toastr.error(`Image generation failed: ${err.message}`);
+    }
+}
+
 // ── Gallery UI ────────────────────────────────────────────────────────────────
 
 async function renderGallery() {
@@ -98,9 +207,7 @@ async function renderGallery() {
     }
 
     $label.text(`Reference images for: ${charName}`);
-
     const images = await loadGalleryFromDB(charName);
-    console.log(`[Img2Img] Rendering gallery for "${charName}" — ${images.length} image(s)`);
 
     if (images.length === 0) {
         $gallery.append(`<p class="img2img_empty">No reference images yet. Upload some below!</p>`);
@@ -130,15 +237,12 @@ async function renderGallery() {
 
 async function handleImageUpload(files) {
     const charName = getCurrentCharacterName();
-    console.log("[Img2Img] Upload triggered. Character:", charName);
-
     if (!charName) {
         alert("Please open a character chat before uploading reference images.");
         return;
     }
 
     const current = await loadGalleryFromDB(charName);
-    console.log("[Img2Img] Existing images in gallery:", current.length);
 
     const readFile = (file) => new Promise((resolve, reject) => {
         const reader = new FileReader();
@@ -148,10 +252,7 @@ async function handleImageUpload(files) {
     });
 
     for (const file of files) {
-        if (!file.type.startsWith("image/")) {
-            console.log("[Img2Img] Skipped non-image:", file.name);
-            continue;
-        }
+        if (!file.type.startsWith("image/")) continue;
         const dataUrl = await readFile(file);
         current.push(dataUrl);
         console.log("[Img2Img] Added:", file.name);
@@ -178,6 +279,13 @@ function renderSettingsPanel() {
                    value="${settings.api_key}" />
             <small>Your key is stored locally and never shared.</small>
 
+            <label style="margin-top:8px;">Image Size</label>
+            <select id="img2img_size" class="text_pole">
+                <option value="1024x1024" ${settings.image_size === "1024x1024" ? "selected" : ""}>1024×1024 (Square)</option>
+                <option value="1024x768"  ${settings.image_size === "1024x768"  ? "selected" : ""}>1024×768 (Landscape)</option>
+                <option value="768x1024"  ${settings.image_size === "768x1024"  ? "selected" : ""}>768×1024 (Portrait)</option>
+            </select>
+
             <hr />
 
             <div id="img2img_gallery_label" class="img2img_section_label">
@@ -193,6 +301,9 @@ function renderSettingsPanel() {
                        multiple
                        style="display:none;" />
             </label>
+
+            <hr />
+            <small>💡 Use <code>/img2img your prompt here</code> in chat to generate.</small>
         </div>
     `;
     $("#extensions_settings").append(html);
@@ -202,11 +313,16 @@ function renderSettingsPanel() {
         saveSettingsDebounced();
     });
 
+    $("#img2img_size").on("change", function () {
+        getSettings().image_size = $(this).val();
+        saveSettingsDebounced();
+    });
+
     $("#img2img_upload_input").on("change", function () {
-    const files = Array.from(this.files); // copy immediately before anything else
-    this.value = "";
-    handleImageUpload(files);
-});
+        const files = Array.from(this.files);
+        this.value = "";
+        handleImageUpload(files);
+    });
 
     renderGallery();
 }
@@ -214,9 +330,7 @@ function renderSettingsPanel() {
 // ── Events ────────────────────────────────────────────────────────────────────
 
 function registerEvents() {
-    eventSource.on(event_types.CHAT_CHANGED, () => {
-        renderGallery();
-    });
+    eventSource.on(event_types.CHAT_CHANGED, () => renderGallery());
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
@@ -226,5 +340,16 @@ jQuery(async () => {
     loadSettings();
     renderSettingsPanel();
     registerEvents();
-    console.log("[Img2Img] Extension ready.");
+
+    // Register the slash command
+    registerSlashCommand(
+        "img2img",
+        handleGenerateCommand,
+        [],
+        "Generate an image using your character's reference gallery. Usage: /img2img a girl standing in a forest",
+        true,
+        true
+    );
+
+    console.log("[Img2Img] Extension ready. Use /img2img [prompt] to generate.");
 });

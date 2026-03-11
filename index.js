@@ -53,7 +53,7 @@ function loadGalleryFromDB(characterName) {
 
 const defaultSettings = {
     api_key: "",
-    model: "seedream-4-5",
+    model: "seedream-v4.5",
     image_size: "1024x1024",
 };
 

@@ -81,3 +81,22 @@
 .img2img_upload_btn:hover {
     background: rgba(255,255,255,0.15);
 }
+
+.img2img_result {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    margin: 4px 0;
+}
+
+.img2img_prompt_label {
+    font-size: 0.8em;
+    opacity: 0.6;
+    font-style: italic;
+}
+
+.img2img_loading_msg {
+    padding: 10px 16px;
+    opacity: 0.7;
+    font-style: italic;
+}

@@ -147,7 +147,7 @@ async function handleImageUpload(files) {
         reader.readAsDataURL(file);
     });
 
-    for (const file of Array.from(files)) {
+    for (const file of files) {
         if (!file.type.startsWith("image/")) {
             console.log("[Img2Img] Skipped non-image:", file.name);
             continue;
@@ -203,9 +203,10 @@ function renderSettingsPanel() {
     });
 
     $("#img2img_upload_input").on("change", function () {
-        handleImageUpload(this.files);
-        this.value = "";
-    });
+    const files = Array.from(this.files); // copy immediately before anything else
+    this.value = "";
+    handleImageUpload(files);
+});
 
     renderGallery();
 }

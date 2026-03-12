@@ -1063,7 +1063,7 @@ function openSetManager() {
 
         // Set list
         const $list = $("#img2img_setmgr_list").empty();
-        setNames.forEach(name => {
+        setNames.forEach((name, idx) => {
             const isActive = name === rec.activeSet;
             const count = rec.sets[name].length;
             const $row = $(`

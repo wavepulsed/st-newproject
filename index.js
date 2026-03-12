@@ -1,5 +1,5 @@
 // Img2Img Reference Generator for SillyTavern
-// Version 0.4.1 — Editable Model ID field
+// Version 0.6.0 — Proper persistence via chatMetadata + IndexedDB
 
 import { extension_settings, getContext } from "../../../extensions.js";
 import { saveSettingsDebounced, eventSource, event_types } from "../../../../script.js";
@@ -8,8 +8,9 @@ import { registerSlashCommand } from "../../../slash-commands.js";
 const extensionName = "st-img2img";
 const NANO_API_URL = "https://nano-gpt.com/api/v1/images/generations";
 const DB_NAME = "img2img_gallery_db";
-const DB_VERSION = 2;
+const DB_VERSION = 3;
 const STORE_NAME = "galleries";
+const HISTORY_STORE = "image_history";
 
 // ── IndexedDB ─────────────────────────────────────────────────────────────────
 
@@ -23,12 +24,12 @@ function openDatabase() {
             if (!database.objectStoreNames.contains(STORE_NAME)) {
                 database.createObjectStore(STORE_NAME, { keyPath: "characterName" });
             }
-            if (!database.objectStoreNames.contains("image_history")) {
-                const historyStore = database.createObjectStore("image_history", {
+            if (!database.objectStoreNames.contains(HISTORY_STORE)) {
+                const store = database.createObjectStore(HISTORY_STORE, {
                     keyPath: "id",
                     autoIncrement: true,
                 });
-                historyStore.createIndex("characterName", "characterName", { unique: false });
+                store.createIndex("characterName", "characterName", { unique: false });
             }
         };
         request.onsuccess = (e) => { db = e.target.result; resolve(db); };
@@ -52,6 +53,31 @@ function loadGalleryFromDB(characterName) {
         const store = tx.objectStore(STORE_NAME);
         const request = store.get(characterName);
         request.onsuccess = (e) => resolve(e.target.result?.images || []);
+        request.onerror = (e) => reject(e.target.error);
+    });
+}
+
+function saveImageToDB(base64, prompt, characterName) {
+    return new Promise((resolve, reject) => {
+        const tx = db.transaction(HISTORY_STORE, "readwrite");
+        const store = tx.objectStore(HISTORY_STORE);
+        const request = store.add({
+            base64,
+            prompt,
+            characterName: characterName || "Unknown",
+            timestamp: Date.now(),
+        });
+        request.onsuccess = (e) => resolve(e.target.result); // returns the auto-increment ID
+        request.onerror = (e) => reject(e.target.error);
+    });
+}
+
+function loadImageFromDB(id) {
+    return new Promise((resolve, reject) => {
+        const tx = db.transaction(HISTORY_STORE, "readonly");
+        const store = tx.objectStore(HISTORY_STORE);
+        const request = store.get(id);
+        request.onsuccess = (e) => resolve(e.target.result || null);
         request.onerror = (e) => reject(e.target.error);
     });
 }
@@ -83,25 +109,145 @@ function getCurrentCharacterName() {
     return context?.name2 || null;
 }
 
-// ── Image persistence ─────────────────────────────────────────────────────────
+// ── Image fetch + persist ─────────────────────────────────────────────────────
 
-// ── Image persistence ─────────────────────────────────────────────────────────
+async function fetchAndStoreImage(remoteUrl, prompt, characterName) {
+    console.log("[Img2Img] Fetching image for local persistence...");
+    const response = await fetch(remoteUrl);
+    if (!response.ok) throw new Error(`Failed to fetch image: ${response.status}`);
+    const blob = await response.blob();
 
-async function saveImageLocally(remoteUrl, characterName, prompt) {
-    const response = await fetch("/api/plugins/img2img/save-image", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ imageUrl: remoteUrl, characterName, prompt }),
+    const base64 = await new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = (e) => resolve(e.target.result);
+        reader.onerror = reject;
+        reader.readAsDataURL(blob);
     });
 
-    if (!response.ok) {
-        const err = await response.text();
-        throw new Error(`Local save failed: ${err}`);
-    }
+    const id = await saveImageToDB(base64, prompt, characterName);
+    console.log("[Img2Img] Image stored in IndexedDB with ID:", id);
+    return { base64, id };
+}
 
-    const data = await response.json();
-    console.log("[Img2Img] Image saved locally at:", data.localPath);
-    return data.localPath; // e.g. /user/images/img2img_Kira_1234567890.jpg
+// ── Chat injection ────────────────────────────────────────────────────────────
+
+function injectImageIntoChat(base64, prompt, imageId) {
+    // Build the message with a data attribute storing the IndexedDB ID
+    // so we can restore it after page refresh
+    const $msg = $(`
+        <div class="mes system_mes img2img_result_msg" data-img2img-id="${imageId}">
+            <div class="mes_block">
+                <div class="mes_text">
+                    <img src="${base64}"
+                         alt="${prompt}"
+                         class="img2img_generated"
+                         style="max-width:100%; border-radius:8px; cursor:pointer;"
+                         title="Click to open full size" />
+                    <div class="img2img_prompt_label">🖼️ ${prompt}</div>
+                </div>
+            </div>
+        </div>
+    `);
+
+    // Full-size viewer via Blob URL (works in Chrome PWA, no blank tab)
+    $msg.find("img").on("click", function () {
+        const src = this.src;
+        // Convert base64 to blob and open as object URL
+        fetch(src)
+            .then(r => r.blob())
+            .then(blob => {
+                const url = URL.createObjectURL(blob);
+                window.open(url, "_blank");
+            });
+    });
+
+    $("#chat").append($msg);
+    $("#chat").scrollTop($("#chat")[0].scrollHeight);
+
+    // Save the image ID into chatMetadata so we can restore after refresh
+    persistImageIdToChat(imageId, prompt);
+}
+
+function persistImageIdToChat(imageId, prompt) {
+    try {
+        const context = getContext();
+        if (!context?.chatMetadata) return;
+        if (!context.chatMetadata.img2img_images) {
+            context.chatMetadata.img2img_images = [];
+        }
+        context.chatMetadata.img2img_images.push({ imageId, prompt, timestamp: Date.now() });
+        context.saveMetadata();
+        console.log("[Img2Img] Image ID saved to chatMetadata:", imageId);
+    } catch (err) {
+        console.warn("[Img2Img] Could not save to chatMetadata:", err);
+    }
+}
+
+// ── Chat restore on load ──────────────────────────────────────────────────────
+
+async function restoreImagesInChat() {
+    try {
+        const context = getContext();
+        const stored = context?.chatMetadata?.img2img_images;
+        if (!stored || stored.length === 0) return;
+
+        console.log(`[Img2Img] Restoring ${stored.length} image(s) from chatMetadata...`);
+
+        // Remove any existing restored messages to avoid duplicates
+        $(".img2img_result_msg").remove();
+
+        for (const entry of stored) {
+            const record = await loadImageFromDB(entry.imageId);
+            if (!record) {
+                console.warn("[Img2Img] Image ID not found in IndexedDB:", entry.imageId);
+                continue;
+            }
+
+            const $msg = $(`
+                <div class="mes system_mes img2img_result_msg" data-img2img-id="${entry.imageId}">
+                    <div class="mes_block">
+                        <div class="mes_text">
+                            <img src="${record.base64}"
+                                 alt="${entry.prompt}"
+                                 class="img2img_generated"
+                                 style="max-width:100%; border-radius:8px; cursor:pointer;"
+                                 title="Click to open full size" />
+                            <div class="img2img_prompt_label">🖼️ ${entry.prompt}</div>
+                        </div>
+                    </div>
+                </div>
+            `);
+
+            $msg.find("img").on("click", function () {
+                fetch(this.src)
+                    .then(r => r.blob())
+                    .then(blob => window.open(URL.createObjectURL(blob), "_blank"));
+            });
+
+            $("#chat").append($msg);
+        }
+
+        $("#chat").scrollTop($("#chat")[0].scrollHeight);
+        console.log("[Img2Img] Restore complete.");
+    } catch (err) {
+        console.warn("[Img2Img] Restore failed:", err);
+    }
+}
+
+// ── Loading indicator ─────────────────────────────────────────────────────────
+
+function showLoadingMessage() {
+    const $loading = $(`
+        <div id="img2img_loading" class="img2img_loading_msg">
+            ⏳ Generating image, please wait...
+        </div>
+    `);
+    $("#chat").append($loading);
+    $("#chat").scrollTop($("#chat")[0].scrollHeight);
+}
+
+function hideLoadingMessage() {
+    $("#img2img_loading").remove();
 }
 
 // ── API call ──────────────────────────────────────────────────────────────────
@@ -116,13 +262,11 @@ async function generateImage(prompt) {
     const charName = getCurrentCharacterName();
     const referenceImages = charName ? await loadGalleryFromDB(charName) : [];
 
-    console.log(`[Img2Img] Generating image for prompt: "${prompt}"`);
-    console.log(`[Img2Img] Using ${referenceImages.length} reference image(s)`);
-    console.log(`[Img2Img] Model: ${settings.model}`);
+    console.log(`[Img2Img] Generating — prompt: "${prompt}", model: ${settings.model}, refs: ${referenceImages.length}`);
 
     const payload = {
         model: settings.model,
-        prompt: prompt,
+        prompt,
         n: 1,
         size: settings.image_size,
         response_format: "url",
@@ -144,54 +288,20 @@ async function generateImage(prompt) {
     });
 
     if (!response.ok) {
-        const errorText = await response.text();
-        throw new Error(`NanoGPT API error ${response.status}: ${errorText}`);
+        const err = await response.text();
+        throw new Error(`NanoGPT API error ${response.status}: ${err}`);
     }
 
     const data = await response.json();
-    console.log("[Img2Img] API response received:", data);
+    console.log("[Img2Img] API response:", data);
 
     const imageUrl = data?.data?.[0]?.url;
-    if (!imageUrl) {
-        throw new Error("API returned no image URL. Full response: " + JSON.stringify(data));
-    }
+    if (!imageUrl) throw new Error("No image URL in response: " + JSON.stringify(data));
 
     return imageUrl;
 }
 
-// ── Chat injection ────────────────────────────────────────────────────────────
-
-function injectImageIntoChat(localPath, prompt) {
-    const messageHtml = `<img src="${localPath}" alt="${prompt}" style="max-width:100%; border-radius:8px; cursor:pointer;" onclick="window.open('${localPath}', '_blank')" title="Click to open full size" /><div class="img2img_prompt_label">🖼️ ${prompt}</div>`;
-
-    const $msg = $(`
-        <div class="mes system_mes img2img_result_msg">
-            <div class="mes_block">
-                <div class="mes_text">${messageHtml}</div>
-            </div>
-        </div>
-    `);
-    $("#chat").append($msg);
-    $("#chat").scrollTop($("#chat")[0].scrollHeight);
-}
-
-// ── Loading indicator ─────────────────────────────────────────────────────────
-
-function showLoadingMessage() {
-    const $loading = $(`
-        <div id="img2img_loading" class="img2img_loading_msg">
-            ⏳ Generating image, please wait...
-        </div>
-    `);
-    $("#chat").append($loading);
-    $("#chat").scrollTop($("#chat")[0].scrollHeight);
-}
-
-function hideLoadingMessage() {
-    $("#img2img_loading").remove();
-}
-
-// ── Main trigger ──────────────────────────────────────────────────────────────
+// ── Main command handler ──────────────────────────────────────────────────────
 
 async function handleGenerateCommand(namedArgs, unnamedValue) {
     const prompt = unnamedValue || namedArgs?.value || "";
@@ -206,17 +316,17 @@ async function handleGenerateCommand(namedArgs, unnamedValue) {
     try {
         const charName = getCurrentCharacterName();
 
-        // Step 1 — generate via API
+        // 1. Generate via API
         const remoteUrl = await generateImage(prompt.trim());
 
-        // Step 2 — save to VPS filesystem
-        const localPath = await saveImageLocally(remoteUrl, charName, prompt.trim());
+        // 2. Fetch and store locally in IndexedDB
+        const { base64, id } = await fetchAndStoreImage(remoteUrl, prompt.trim(), charName);
 
-        // Step 3 — inject into chat using local path
+        // 3. Inject into chat using local base64
         hideLoadingMessage();
-        injectImageIntoChat(localPath, prompt.trim());
+        injectImageIntoChat(base64, prompt.trim(), id);
 
-        toastr.success("Image generated and saved locally.");
+        toastr.success(`Image generated and saved locally.`);
     } catch (err) {
         hideLoadingMessage();
         console.error("[Img2Img] Generation failed:", err);
@@ -279,7 +389,7 @@ async function handleImageUpload(files) {
     const readFile = (file) => new Promise((resolve, reject) => {
         const reader = new FileReader();
         reader.onload = (e) => resolve(e.target.result);
-        reader.onerror = (e) => reject(e);
+        reader.onerror = reject;
         reader.readAsDataURL(file);
     });
 
@@ -343,6 +453,8 @@ function renderSettingsPanel() {
             </label>
 
             <hr />
+            <small>ℹ️ Seedream 4.5 supports up to 10 reference images. Check your model's documentation for its specific limit.</small>
+            <br/>
             <small>💡 Use <code>/img2img your prompt here</code> in chat to generate.</small>
         </div>
     `;
@@ -375,7 +487,11 @@ function renderSettingsPanel() {
 // ── Events ────────────────────────────────────────────────────────────────────
 
 function registerEvents() {
-    eventSource.on(event_types.CHAT_CHANGED, () => renderGallery());
+    eventSource.on(event_types.CHAT_CHANGED, () => {
+        renderGallery();
+        // Small delay to let ST finish rendering the chat before we restore
+        setTimeout(restoreImagesInChat, 500);
+    });
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
@@ -394,6 +510,9 @@ jQuery(async () => {
         true,
         true
     );
+
+    // Restore any images from the current chat on initial load
+    setTimeout(restoreImagesInChat, 1000);
 
     console.log("[Img2Img] Extension ready. Use /img2img [prompt] to generate.");
 });

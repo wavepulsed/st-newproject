@@ -18,7 +18,7 @@ const STORE_NAME = "galleries";
 
 const MODEL_SIZES = {
     "seedream-v4.5": [
-        { value: "1920x1920", label: "1092x1092 — Min Square" },
+        { value: "1920x1920", label: "1920x1920 — Min Square" },
         { value: "2048x2048", label: "2048×2048 — Default Square (2K)" },
         { value: "2496x1664", label: "2496×1664 — Min Landscape (3:2)" },
         { value: "1664x2496", label: "1664×2496 — Min Portrait (2:3)" },

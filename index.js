@@ -129,19 +129,14 @@ async function injectImageIntoChat(localPath, prompt) {
         extra: {
             isSmallSys: false,
             img2img: true,
-            image: localPath,  // ST uses extra.image for swipe regeneration
+            image: localPath,       // ST checks this on reload to restore the image
+            title: prompt,          // ST uses this as the image caption/alt text
         },
     };
 
-    context.chat.push(message);
-    const messageIndex = context.chat.length - 1;
-
-    // Use "normal" type instead of "narrator" so ST builds the full
-    // mes_text wrapper structure that swipe and lightbox handlers expect
+    // Do NOT push to context.chat manually — addOneMessage handles that internally
+    const messageIndex = context.chat.length;
     await addOneMessage(message, { type: "normal", insertAt: messageIndex });
-
-    // Do NOT add our own click handler — img_enlarged_thumb is already
-    // added by ST automatically and its native handler takes over
 
     await saveChatDebounced();
     $("#chat").scrollTop($("#chat")[0].scrollHeight);

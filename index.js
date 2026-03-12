@@ -1,17 +1,19 @@
 // Img2Img Reference Generator for SillyTavern
-// Version 0.10.0 — Named reference image sets
+// Version 0.11.0 — Auto-prompt, prefix/suffix, preview modal
 
 import { extension_settings, getContext } from "../../../extensions.js";
-import { saveSettingsDebounced, eventSource, event_types, saveChatDebounced, addOneMessage } from "../../../../script.js";
+import { saveSettingsDebounced, eventSource, event_types, saveChatDebounced, addOneMessage, generateQuietPrompt } from "../../../../script.js";
 import { registerSlashCommand } from "../../../slash-commands.js";
 import { saveBase64AsFile } from "../../../../scripts/utils.js";
 
 const extensionName = "st-img2img";
 const NANO_API_URL = "https://nano-gpt.com/api/v1/images/generations";
 const DB_NAME = "img2img_gallery_db";
-const DB_VERSION = 4;   // bumped — schema change for sets
+const DB_VERSION = 4;
 const STORE_NAME = "galleries";
 const DEFAULT_SET = "Default";
+
+const DEFAULT_AUTO_PROMPT_TEMPLATE = `Based on the current scene, write a concise image generation prompt describing the visual. Focus on: character appearance, pose, expression, clothing, setting, and lighting. Reply with only the image prompt — no explanation, no preamble, no punctuation at the end.`;
 
 // ── Size map per model ────────────────────────────────────────────────────────
 
@@ -36,8 +38,7 @@ const DEFAULT_SIZES = [
 ];
 
 // ── IndexedDB ─────────────────────────────────────────────────────────────────
-// Schema v4: { characterName, sets: { [setName]: [dataUrl, ...] }, activeSet }
-// Migration: v3 flat { characterName, images } → v4 sets.Default
+// Schema: { characterName, sets, activeSet, char_prefix, char_suffix }
 
 let db = null;
 
@@ -62,7 +63,6 @@ function openDatabase() {
     });
 }
 
-// Migrate old flat { images: [] } records to { sets: { Default: [] }, activeSet }
 async function migrateV3toV4() {
     return new Promise((resolve) => {
         const tx = db.transaction(STORE_NAME, "readwrite");
@@ -75,11 +75,12 @@ async function migrateV3toV4() {
 
             for (const record of records) {
                 if (record.images && !record.sets) {
-                    // Old schema — wrap existing images into Default set
                     store.put({
                         characterName: record.characterName,
                         sets: { [DEFAULT_SET]: record.images },
                         activeSet: DEFAULT_SET,
+                        char_prefix: "",
+                        char_suffix: "",
                     });
                     migrated++;
                 }
@@ -87,17 +88,16 @@ async function migrateV3toV4() {
 
             tx.oncomplete = () => {
                 if (migrated > 0) {
-                    console.log(`[Img2Img] Migrated ${migrated} gallery record(s) to sets schema.`);
+                    console.log(`[Img2Img] Migrated ${migrated} record(s) to v4 schema.`);
                 }
                 resolve();
             };
         };
 
-        req.onerror = () => resolve(); // non-fatal
+        req.onerror = () => resolve();
     });
 }
 
-// Returns the full record: { characterName, sets, activeSet }
 function loadRecordFromDB(characterName) {
     return new Promise((resolve, reject) => {
         const tx = db.transaction(STORE_NAME, "readonly");
@@ -106,10 +106,18 @@ function loadRecordFromDB(characterName) {
         request.onsuccess = (e) => {
             const result = e.target.result;
             if (result) {
+                // Ensure prefix/suffix fields exist on old records
+                result.char_prefix = result.char_prefix ?? "";
+                result.char_suffix = result.char_suffix ?? "";
                 resolve(result);
             } else {
-                // No record yet — return a fresh default structure
-                resolve({ characterName, sets: { [DEFAULT_SET]: [] }, activeSet: DEFAULT_SET });
+                resolve({
+                    characterName,
+                    sets: { [DEFAULT_SET]: [] },
+                    activeSet: DEFAULT_SET,
+                    char_prefix: "",
+                    char_suffix: "",
+                });
             }
         };
         request.onerror = (e) => reject(e.target.error);
@@ -126,13 +134,6 @@ function saveRecordToDB(record) {
     });
 }
 
-// Convenience: get images for a specific set
-async function loadSetImages(characterName, setName) {
-    const record = await loadRecordFromDB(characterName);
-    return record.sets[setName] || [];
-}
-
-// Convenience: get images for the active set
 async function loadActiveSetImages(characterName) {
     const record = await loadRecordFromDB(characterName);
     return record.sets[record.activeSet] || [];
@@ -144,6 +145,10 @@ const defaultSettings = {
     api_key: "",
     model: "seedream-v4.5",
     image_size: "2048x2048",
+    global_prefix: "",
+    global_suffix: "",
+    auto_prompt_template: DEFAULT_AUTO_PROMPT_TEMPLATE,
+    auto_prompt_preview: true,
 };
 
 function loadSettings() {
@@ -163,6 +168,117 @@ function getSettings() {
 function getCurrentCharacterName() {
     const context = getContext();
     return context?.name2 || null;
+}
+
+// ── Prompt assembly ───────────────────────────────────────────────────────────
+
+async function getEffectivePrefix(charName) {
+    if (charName) {
+        const record = await loadRecordFromDB(charName);
+        if (record.char_prefix && record.char_prefix.trim()) {
+            return record.char_prefix.trim();
+        }
+    }
+    return getSettings().global_prefix.trim();
+}
+
+async function getEffectiveSuffix(charName) {
+    if (charName) {
+        const record = await loadRecordFromDB(charName);
+        if (record.char_suffix && record.char_suffix.trim()) {
+            return record.char_suffix.trim();
+        }
+    }
+    return getSettings().global_suffix.trim();
+}
+
+function assemblePrompt(corePrompt, prefix, suffix) {
+    return [prefix, corePrompt, suffix]
+        .map(s => s.trim())
+        .filter(Boolean)
+        .join(", ");
+}
+
+// Strip common AI preamble patterns from auto-generated prompts
+function stripPreamble(text) {
+    return text
+        .replace(/^(here(?:'s| is)(?: your| the| an?)?(?: image)?(?: generation)?(?: prompt)?[:\-–—]*\s*)/i, "")
+        .replace(/^(image(?: generation)? prompt[:\-–—]*\s*)/i, "")
+        .replace(/^(prompt[:\-–—]*\s*)/i, "")
+        .replace(/^["']|["']$/g, "")  // strip wrapping quotes
+        .trim();
+}
+
+// ── Auto-prompt from chat context ─────────────────────────────────────────────
+
+async function generateAutoPrompt() {
+    const template = getSettings().auto_prompt_template || DEFAULT_AUTO_PROMPT_TEMPLATE;
+
+    toastr.info("Generating scene description…", "", { timeOut: 2000 });
+
+    try {
+        const rawPrompt = await generateQuietPrompt(template, false, false);
+        if (!rawPrompt || !rawPrompt.trim()) {
+            throw new Error("Empty response from chat API.");
+        }
+        return stripPreamble(rawPrompt);
+    } catch (err) {
+        throw new Error(`Auto-prompt failed: ${err.message}`);
+    }
+}
+
+// ── Preview modal ─────────────────────────────────────────────────────────────
+
+function showPromptModal(initialPrompt, onConfirm) {
+    // Remove any existing modal first
+    $("#img2img_modal_overlay").remove();
+
+    const $overlay = $(`
+        <div id="img2img_modal_overlay">
+            <div id="img2img_modal">
+                <div id="img2img_modal_header">
+                    <span>🖼️ Edit Image Prompt</span>
+                    <button id="img2img_modal_close" title="Cancel">✕</button>
+                </div>
+                <textarea id="img2img_modal_prompt" rows="5">${initialPrompt}</textarea>
+                <div id="img2img_modal_footer">
+                    <button id="img2img_modal_cancel" class="menu_button">Cancel</button>
+                    <button id="img2img_modal_generate" class="menu_button menu_button_primary">Generate</button>
+                </div>
+            </div>
+        </div>
+    `);
+
+    $("body").append($overlay);
+
+    // Focus and select all text for quick editing
+    const $textarea = $("#img2img_modal_prompt");
+    $textarea.focus().select();
+
+    const closeModal = () => $("#img2img_modal_overlay").remove();
+
+    $("#img2img_modal_close, #img2img_modal_cancel").on("click", closeModal);
+
+    $("#img2img_modal_overlay").on("click", function (e) {
+        if ($(e.target).is("#img2img_modal_overlay")) closeModal();
+    });
+
+    $("#img2img_modal_generate").on("click", () => {
+        const prompt = $textarea.val().trim();
+        if (!prompt) {
+            toastr.warning("Prompt cannot be empty.");
+            return;
+        }
+        closeModal();
+        onConfirm(prompt);
+    });
+
+    // Ctrl+Enter to generate
+    $textarea.on("keydown", (e) => {
+        if (e.ctrlKey && e.key === "Enter") {
+            $("#img2img_modal_generate").trigger("click");
+        }
+    });
 }
 
 // ── Size dropdown ─────────────────────────────────────────────────────────────
@@ -213,11 +329,9 @@ function validateAndSaveCustomSize() {
     toastr.success(`Custom size set: ${w}×${h}`);
 }
 
-// ── Image fetch + save to ST filesystem ──────────────────────────────────────
+// ── Image fetch + save ────────────────────────────────────────────────────────
 
 async function fetchAndSaveImage(remoteUrl, characterName) {
-    console.log("[Img2Img] Fetching image from CDN...");
-
     const response = await fetch(remoteUrl);
     if (!response.ok) throw new Error(`Failed to fetch image: ${response.status}`);
 
@@ -234,8 +348,7 @@ async function fetchAndSaveImage(remoteUrl, characterName) {
 
     const fileName = `img2img_${Date.now()}`;
     const localUrl = await saveBase64AsFile(base64, characterName || "img2img", fileName, ext);
-
-    console.log("[Img2Img] Image saved to ST filesystem:", localUrl);
+    console.log("[Img2Img] Image saved:", localUrl);
     return localUrl;
 }
 
@@ -287,7 +400,7 @@ function hideLoadingMessage() {
 
 // ── API call ──────────────────────────────────────────────────────────────────
 
-async function generateImage(prompt) {
+async function generateImage(finalPrompt) {
     const settings = getSettings();
 
     if (!settings.api_key) {
@@ -297,11 +410,12 @@ async function generateImage(prompt) {
     const charName = getCurrentCharacterName();
     const referenceImages = charName ? await loadActiveSetImages(charName) : [];
 
-    console.log(`[Img2Img] Generating — prompt: "${prompt}", model: ${settings.model}, size: ${settings.image_size}, refs: ${referenceImages.length}`);
+    console.log(`[Img2Img] Generating — model: ${settings.model}, size: ${settings.image_size}, refs: ${referenceImages.length}`);
+    console.log(`[Img2Img] Final prompt: "${finalPrompt}"`);
 
     const payload = {
         model: settings.model,
-        prompt,
+        prompt: finalPrompt,
         n: 1,
         size: settings.image_size,
         response_format: "url",
@@ -328,39 +442,64 @@ async function generateImage(prompt) {
     }
 
     const data = await response.json();
-    console.log("[Img2Img] API response:", data);
-
     const imageUrl = data?.data?.[0]?.url;
     if (!imageUrl) throw new Error("No image URL in response: " + JSON.stringify(data));
 
     return imageUrl;
 }
 
-// ── Main command handler ──────────────────────────────────────────────────────
+// ── Core generate pipeline ────────────────────────────────────────────────────
 
-async function handleGenerateCommand(namedArgs, unnamedValue) {
-    const prompt = unnamedValue || namedArgs?.value || "";
-
-    if (!prompt.trim()) {
-        toastr.warning("Please provide a prompt. Usage: /img2img a girl in a forest");
-        return;
-    }
-
+async function runGeneration(corePrompt) {
     showLoadingMessage();
-
     try {
         const charName = getCurrentCharacterName();
-        const remoteUrl = await generateImage(prompt.trim());
+        const prefix = await getEffectivePrefix(charName);
+        const suffix = await getEffectiveSuffix(charName);
+        const finalPrompt = assemblePrompt(corePrompt, prefix, suffix);
+
+        const remoteUrl = await generateImage(finalPrompt);
         const localPath = await fetchAndSaveImage(remoteUrl, charName);
 
         hideLoadingMessage();
-        await injectImageIntoChat(localPath, prompt.trim());
-
-        toastr.success("Image generated and saved to ST gallery.");
+        await injectImageIntoChat(localPath, finalPrompt);
+        toastr.success("Image generated and saved to gallery.");
     } catch (err) {
         hideLoadingMessage();
         console.error("[Img2Img] Generation failed:", err);
-        toastr.error(`Image generation failed: ${err.message}`);
+        toastr.error(`Generation failed: ${err.message}`);
+    }
+}
+
+// ── Main command handler ──────────────────────────────────────────────────────
+
+async function handleGenerateCommand(namedArgs, unnamedValue) {
+    const manualPrompt = (unnamedValue || namedArgs?.value || "").trim();
+    const settings = getSettings();
+
+    if (manualPrompt) {
+        // Manual prompt provided — use it directly
+        await runGeneration(manualPrompt);
+        return;
+    }
+
+    // No prompt — use auto-prompt from chat context
+    let autoPrompt;
+    try {
+        autoPrompt = await generateAutoPrompt();
+    } catch (err) {
+        toastr.error(err.message);
+        return;
+    }
+
+    if (settings.auto_prompt_preview) {
+        // Show modal for editing before generating
+        showPromptModal(autoPrompt, (editedPrompt) => {
+            runGeneration(editedPrompt);
+        });
+    } else {
+        // Fire immediately
+        await runGeneration(autoPrompt);
     }
 }
 
@@ -369,7 +508,6 @@ async function handleGenerateCommand(namedArgs, unnamedValue) {
 async function renderGallery() {
     const charName = getCurrentCharacterName();
     const $container = $("#img2img_gallery_container");
-
     $container.empty();
 
     if (!charName) {
@@ -381,36 +519,57 @@ async function renderGallery() {
     const setNames = Object.keys(record.sets);
     const activeSet = record.activeSet;
 
+    // ── Per-character prefix/suffix ──
+    $container.append(`<label class="img2img_section_label">Character Overrides <small style="font-weight:normal; color:#aaa;">(leave blank to use global)</small></label>`);
+
+    const $overrides = $(`<div class="img2img_overrides"></div>`);
+    $overrides.append(`
+        <label style="font-size:0.85em;">Prompt Prefix</label>
+        <input type="text" id="img2img_char_prefix" class="text_pole"
+               placeholder="Overrides global prefix for ${charName}"
+               value="${record.char_prefix || ""}" />
+        <label style="font-size:0.85em; margin-top:6px;">Prompt Suffix</label>
+        <input type="text" id="img2img_char_suffix" class="text_pole"
+               placeholder="Overrides global suffix for ${charName}"
+               value="${record.char_suffix || ""}" />
+    `);
+    $container.append($overrides);
+
+    $("#img2img_char_prefix").on("input", async function () {
+        const rec = await loadRecordFromDB(charName);
+        rec.char_prefix = $(this).val();
+        await saveRecordToDB(rec);
+    });
+
+    $("#img2img_char_suffix").on("input", async function () {
+        const rec = await loadRecordFromDB(charName);
+        rec.char_suffix = $(this).val();
+        await saveRecordToDB(rec);
+    });
+
+    $container.append(`<hr style="margin:10px 0;"/>`);
+
     // ── Set selector row ──
     $container.append(`<label class="img2img_section_label">Sets</label>`);
     const $setRow = $(`<div class="img2img_set_row" style="display:flex; flex-direction:row; align-items:center; gap:6px; flex-wrap:wrap;"></div>`);
 
-    // Dropdown of existing sets
-    const $setSelect = $(`<select class="text_pole img2img_set_select"></select>`);
+    const $setSelect = $(`<select class="text_pole img2img_set_select" style="flex:1;"></select>`);
     setNames.forEach(name => {
         const selected = name === activeSet ? "selected" : "";
         $setSelect.append(`<option value="${name}" ${selected}>${name} (${record.sets[name].length})</option>`);
     });
 
-    // New set button
-    const $newBtn = $(`<button class="menu_button img2img_icon_btn" title="New set">＋</button>`);
-
-    // Rename set button
+    const $newBtn    = $(`<button class="menu_button img2img_icon_btn" title="New set">＋</button>`);
     const $renameBtn = $(`<button class="menu_button img2img_icon_btn" title="Rename set">✏️</button>`);
-
-    // Delete set button (disabled if only one set remains)
-    const $deleteBtn = $(`<button class="menu_button img2img_icon_btn" title="Delete set"
-        ${setNames.length <= 1 ? "disabled" : ""}>🗑️</button>`);
+    const $deleteBtn = $(`<button class="menu_button img2img_icon_btn" title="Delete set" ${setNames.length <= 1 ? "disabled" : ""}>🗑️</button>`);
 
     $setRow.append($setSelect, $newBtn, $renameBtn, $deleteBtn);
     $container.append($setRow);
 
-    // ── Image count note ──
+    // ── Image count + thumbnails ──
     const imgCount = record.sets[activeSet]?.length || 0;
-    const $countNote = $(`<small class="img2img_muted">${imgCount} image${imgCount !== 1 ? "s" : ""} in this set.</small>`);
-    $container.append($countNote);
+    $container.append(`<small class="img2img_muted" style="display:block; margin:4px 0;">${imgCount} image${imgCount !== 1 ? "s" : ""} in this set.</small>`);
 
-    // ── Thumbnails ──
     const $gallery = $(`<div id="img2img_gallery"></div>`);
     $container.append($gallery);
 
@@ -436,7 +595,7 @@ async function renderGallery() {
         });
     }
 
-    // ── Set selector: switch active set ──
+    // ── Set controls ──
     $setSelect.on("change", async function () {
         const rec = await loadRecordFromDB(charName);
         rec.activeSet = $(this).val();
@@ -444,18 +603,12 @@ async function renderGallery() {
         renderGallery();
     });
 
-    // ── New set ──
     $newBtn.on("click", async () => {
         const name = prompt_input("Name for new set:", "New Set");
         if (!name || !name.trim()) return;
         const trimmed = name.trim();
-
         const rec = await loadRecordFromDB(charName);
-        if (rec.sets[trimmed]) {
-            toastr.warning(`A set named "${trimmed}" already exists.`);
-            return;
-        }
-
+        if (rec.sets[trimmed]) { toastr.warning(`A set named "${trimmed}" already exists.`); return; }
         rec.sets[trimmed] = [];
         rec.activeSet = trimmed;
         await saveRecordToDB(rec);
@@ -463,19 +616,13 @@ async function renderGallery() {
         renderGallery();
     });
 
-    // ── Rename set ──
     $renameBtn.on("click", async () => {
         const rec = await loadRecordFromDB(charName);
         const oldName = rec.activeSet;
         const newName = prompt_input("Rename set:", oldName);
         if (!newName || !newName.trim() || newName.trim() === oldName) return;
         const trimmed = newName.trim();
-
-        if (rec.sets[trimmed]) {
-            toastr.warning(`A set named "${trimmed}" already exists.`);
-            return;
-        }
-
+        if (rec.sets[trimmed]) { toastr.warning(`A set named "${trimmed}" already exists.`); return; }
         rec.sets[trimmed] = rec.sets[oldName];
         delete rec.sets[oldName];
         rec.activeSet = trimmed;
@@ -484,15 +631,11 @@ async function renderGallery() {
         renderGallery();
     });
 
-    // ── Delete set ──
     $deleteBtn.on("click", async () => {
         const rec = await loadRecordFromDB(charName);
-        const setNames = Object.keys(rec.sets);
-        if (setNames.length <= 1) return; // shouldn't be reachable, button is disabled
-
+        if (Object.keys(rec.sets).length <= 1) return;
         const toDelete = rec.activeSet;
         if (!confirm(`Delete set "${toDelete}" and all its images?`)) return;
-
         delete rec.sets[toDelete];
         rec.activeSet = Object.keys(rec.sets)[0];
         await saveRecordToDB(rec);
@@ -501,7 +644,6 @@ async function renderGallery() {
     });
 }
 
-// Thin wrapper around window.prompt to keep things testable / replaceable later
 function prompt_input(message, defaultValue) {
     return window.prompt(message, defaultValue);
 }
@@ -529,7 +671,6 @@ async function handleImageUpload(files) {
         if (!file.type.startsWith("image/")) continue;
         const dataUrl = await readFile(file);
         record.sets[activeSet].push(dataUrl);
-        console.log(`[Img2Img] Added image to set "${activeSet}":`, file.name);
     }
 
     await saveRecordToDB(record);
@@ -559,7 +700,7 @@ function renderSettingsPanel() {
                    class="text_pole"
                    placeholder="e.g. seedream-v4.5"
                    value="${settings.model}" />
-            <small>Enter your model's exact API ID. Find it at <a href="https://nano-gpt.com/models" target="_blank">nano-gpt.com/models</a>.</small>
+            <small>Find model IDs at <a href="https://nano-gpt.com/models" target="_blank">nano-gpt.com/models</a>.</small>
 
             <label style="margin-top:10px;">Image Size</label>
             <select id="img2img_size" class="text_pole"></select>
@@ -584,6 +725,44 @@ function renderSettingsPanel() {
 
             <hr />
 
+            <label>Global Prompt Prefix</label>
+            <input type="text"
+                   id="img2img_global_prefix"
+                   class="text_pole"
+                   placeholder="e.g. Change nothing about the character's appearance."
+                   value="${settings.global_prefix}" />
+            <small>Prepended to every generation. Per-character prefix overrides this when set.</small>
+
+            <label style="margin-top:10px;">Global Prompt Suffix</label>
+            <input type="text"
+                   id="img2img_global_suffix"
+                   class="text_pole"
+                   placeholder="e.g. anime style, high quality, detailed"
+                   value="${settings.global_suffix}" />
+            <small>Appended to every generation. Per-character suffix overrides this when set.</small>
+
+            <hr />
+
+            <label>Auto-Prompt Template</label>
+            <textarea id="img2img_auto_template"
+                      class="text_pole"
+                      rows="4"
+                      placeholder="Instruction sent to your chat API when /img2img is used with no prompt."
+            >${settings.auto_prompt_template}</textarea>
+            <small>Sent to your main chat API to generate a scene description. The result becomes the image prompt.</small>
+
+            <div style="display:flex; align-items:center; gap:8px; margin-top:10px;">
+                <input type="checkbox"
+                       id="img2img_auto_preview"
+                       ${settings.auto_prompt_preview ? "checked" : ""} />
+                <label for="img2img_auto_preview" style="margin:0; cursor:pointer;">
+                    Preview &amp; edit prompt before generating
+                </label>
+            </div>
+            <small>When checked, /img2img with no prompt shows an editable popup before generating. Ctrl+Enter to confirm.</small>
+
+            <hr />
+
             <div id="img2img_gallery_container"></div>
 
             <label class="img2img_upload_btn" for="img2img_upload_input" style="margin-top:8px;">
@@ -598,7 +777,7 @@ function renderSettingsPanel() {
             <hr />
             <small>ℹ️ Seedream 4.5 supports up to 10 reference images. Check your model's docs for its specific limit.</small>
             <br/>
-            <small>💡 Use <code>/img2img your prompt here</code> in chat to generate.</small>
+            <small>💡 <code>/img2img your prompt</code> — manual prompt &nbsp;|&nbsp; <code>/img2img</code> — auto-generate from scene</small>
         </div>
     `;
     $("#extensions_settings").append(html);
@@ -625,6 +804,26 @@ function renderSettingsPanel() {
     });
 
     $("#img2img_custom_w, #img2img_custom_h").on("change", validateAndSaveCustomSize);
+
+    $("#img2img_global_prefix").on("input", function () {
+        getSettings().global_prefix = $(this).val();
+        saveSettingsDebounced();
+    });
+
+    $("#img2img_global_suffix").on("input", function () {
+        getSettings().global_suffix = $(this).val();
+        saveSettingsDebounced();
+    });
+
+    $("#img2img_auto_template").on("input", function () {
+        getSettings().auto_prompt_template = $(this).val();
+        saveSettingsDebounced();
+    });
+
+    $("#img2img_auto_preview").on("change", function () {
+        getSettings().auto_prompt_preview = $(this).is(":checked");
+        saveSettingsDebounced();
+    });
 
     $("#img2img_upload_input").on("change", function () {
         const files = Array.from(this.files);
@@ -656,10 +855,10 @@ jQuery(async () => {
         "img2img",
         handleGenerateCommand,
         [],
-        "Generate an image using your character's active reference set. Usage: /img2img a girl standing in a forest",
+        "Generate an image. With a prompt: /img2img girl in a forest. Without: /img2img auto-generates from the current scene.",
         true,
         true
     );
 
-    console.log("[Img2Img] Extension ready (v0.10.0). Use /img2img [prompt] to generate.");
+    console.log("[Img2Img] Extension ready (v0.11.0). /img2img [prompt] or /img2img for auto-prompt.");
 });

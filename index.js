@@ -1,5 +1,5 @@
 // Img2Img Reference Generator for SillyTavern
-// Version 0.13.1 — Drag fixes, Set Manager modal
+// Version 0.13.2 — FAB drag click fix, set reordering
 
 import { extension_settings, getContext } from "../../../extensions.js";
 import { saveSettingsDebounced, eventSource, event_types, saveChatDebounced, addOneMessage } from "../../../../script.js";
@@ -61,6 +61,7 @@ const DEFAULT_SIZES = [
 // Schema: { characterName, sets, activeSet, char_prefix, char_suffix }
 
 let db = null;
+let _fabDragJustOccurred = false;  // suppresses FAB click after drag
 
 function openDatabase() {
     return new Promise((resolve, reject) => {
@@ -802,6 +803,7 @@ async function refreshWidgetState() {
 }
 
 function toggleWidget() {
+    if (_fabDragJustOccurred) { _fabDragJustOccurred = false; return; }
     const $panel = $("#img2img_widget_panel");
     if ($panel.is(":visible")) closeWidget();
     else openWidget();
@@ -876,13 +878,34 @@ function initWidgetDrag($container, $handle, $fab) {
                 bottom: parseInt($container.css("bottom")) || 80,
             };
             saveSettingsDebounced();
+            _fabDragJustOccurred = true;
         }
     });
 
-    // Suppress the FAB click when the user was actually dragging
-    $fab.on("click.img2img_drag", (e) => {
-        if (didDrag) { e.stopImmediatePropagation(); didDrag = false; }
-    });
+
+}
+
+
+// ── Set reorder helper ────────────────────────────────────────────────────────
+
+async function moveSet(charName, setName, direction) {
+    const rec   = await loadRecordFromDB(charName);
+    const keys  = Object.keys(rec.sets);
+    const idx   = keys.indexOf(setName);
+    const newIdx = idx + direction;
+    if (newIdx < 0 || newIdx >= keys.length) return;
+
+    // Swap
+    [keys[idx], keys[newIdx]] = [keys[newIdx], keys[idx]];
+
+    // Rebuild sets object in new order
+    const reordered = {};
+    keys.forEach(k => { reordered[k] = rec.sets[k]; });
+    rec.sets = reordered;
+
+    await saveRecordToDB(rec);
+    refreshWidgetState();
+    renderGallery();
 }
 
 // ── Set Manager modal ────────────────────────────────────────────────────────
@@ -1048,7 +1071,9 @@ function openSetManager() {
                     <span class="img2img_setmgr_set_name">${name}</span>
                     <span class="img2img_setmgr_set_count">${count} image${count !== 1 ? "s" : ""}</span>
                     <div class="img2img_setmgr_set_btns">
-                        <button class="img2img_setmgr_set_btn rename-btn" data-set="${name}" title="Rename">✏️</button>
+                        <button class="img2img_setmgr_set_btn move-up-btn"   data-set="${name}" title="Move up"   ${idx === 0 ? "disabled" : ""}>▲</button>
+                        <button class="img2img_setmgr_set_btn move-down-btn" data-set="${name}" title="Move down" ${idx === setNames.length - 1 ? "disabled" : ""}>▼</button>
+                        <button class="img2img_setmgr_set_btn rename-btn"    data-set="${name}" title="Rename">✏️</button>
                         <button class="img2img_setmgr_set_btn danger delete-btn" data-set="${name}"
                                 title="Delete" ${setNames.length <= 1 ? "disabled" : ""}>🗑️</button>
                     </div>
@@ -1062,6 +1087,18 @@ function openSetManager() {
                 await saveRecordToDB(r);
                 refreshWidgetState();
                 renderGallery();
+                renderSetMgr();
+            });
+
+            $row.find(".move-up-btn").on("click", async (e) => {
+                e.stopPropagation();
+                await moveSet(charName, name, -1);
+                renderSetMgr();
+            });
+
+            $row.find(".move-down-btn").on("click", async (e) => {
+                e.stopPropagation();
+                await moveSet(charName, name, 1);
                 renderSetMgr();
             });
 
@@ -1269,10 +1306,12 @@ async function renderGallery() {
         const selected = name === activeSet ? "selected" : "";
         $setSelect.append(`<option value="${name}" ${selected}>${name} (${record.sets[name].length})</option>`);
     });
+    const $upBtn     = $(`<button class="menu_button img2img_icon_btn" title="Move set up"   ${setNames.indexOf(activeSet) === 0 ? "disabled" : ""}>▲</button>`);
+    const $downBtn   = $(`<button class="menu_button img2img_icon_btn" title="Move set down" ${setNames.indexOf(activeSet) === setNames.length - 1 ? "disabled" : ""}>▼</button>`);
     const $newBtn    = $(`<button class="menu_button img2img_icon_btn" title="New set">＋</button>`);
     const $renameBtn = $(`<button class="menu_button img2img_icon_btn" title="Rename set">✏️</button>`);
     const $deleteBtn = $(`<button class="menu_button img2img_icon_btn" title="Delete set" ${setNames.length <= 1 ? "disabled" : ""}>🗑️</button>`);
-    $setRow.append($setSelect, $newBtn, $renameBtn, $deleteBtn);
+    $setRow.append($setSelect, $upBtn, $downBtn, $newBtn, $renameBtn, $deleteBtn);
     $container.append($setRow);
 
     // Image count + thumbnails
@@ -1310,6 +1349,16 @@ async function renderGallery() {
         await saveRecordToDB(rec);
         renderGallery();
         refreshWidgetState();
+    });
+
+    $upBtn.on("click", async () => {
+        await moveSet(charName, activeSet, -1);
+        renderGallery();
+    });
+
+    $downBtn.on("click", async () => {
+        await moveSet(charName, activeSet, 1);
+        renderGallery();
     });
 
     $newBtn.on("click", async () => {
@@ -1554,5 +1603,5 @@ jQuery(async () => {
         true
     );
 
-    console.log("[Img2Img] Extension ready (v0.13.1). Floating widget active.");
+    console.log("[Img2Img] Extension ready (v0.13.2). Floating widget active.");
 });

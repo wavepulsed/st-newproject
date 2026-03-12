@@ -1,5 +1,5 @@
 // Img2Img Reference Generator for SillyTavern
-// Version 0.9.1 — Dynamic size dropdown, custom size support
+// Version 0.10.0 — Named reference image sets
 
 import { extension_settings, getContext } from "../../../extensions.js";
 import { saveSettingsDebounced, eventSource, event_types, saveChatDebounced, addOneMessage } from "../../../../script.js";
@@ -9,16 +9,15 @@ import { saveBase64AsFile } from "../../../../scripts/utils.js";
 const extensionName = "st-img2img";
 const NANO_API_URL = "https://nano-gpt.com/api/v1/images/generations";
 const DB_NAME = "img2img_gallery_db";
-const DB_VERSION = 3;
+const DB_VERSION = 4;   // bumped — schema change for sets
 const STORE_NAME = "galleries";
+const DEFAULT_SET = "Default";
 
 // ── Size map per model ────────────────────────────────────────────────────────
-// Add entries here as new models are supported.
-// Falls back to DEFAULT_SIZES for any model not listed.
 
 const MODEL_SIZES = {
     "seedream-v4.5": [
-        { value: "1920x1920", label: "1920x1920 — Min Square" },
+        { value: "1920x1920", label: "1920×1920 — Min Square" },
         { value: "2048x2048", label: "2048×2048 — Default Square (2K)" },
         { value: "2496x1664", label: "2496×1664 — Min Landscape (3:2)" },
         { value: "1664x2496", label: "1664×2496 — Min Portrait (2:3)" },
@@ -36,42 +35,107 @@ const DEFAULT_SIZES = [
     { value: "custom",    label: "Custom…" },
 ];
 
-// ── IndexedDB (reference image gallery only) ──────────────────────────────────
+// ── IndexedDB ─────────────────────────────────────────────────────────────────
+// Schema v4: { characterName, sets: { [setName]: [dataUrl, ...] }, activeSet }
+// Migration: v3 flat { characterName, images } → v4 sets.Default
 
 let db = null;
 
 function openDatabase() {
     return new Promise((resolve, reject) => {
         const request = indexedDB.open(DB_NAME, DB_VERSION);
+
         request.onupgradeneeded = (e) => {
             const database = e.target.result;
             if (!database.objectStoreNames.contains(STORE_NAME)) {
                 database.createObjectStore(STORE_NAME, { keyPath: "characterName" });
             }
         };
-        request.onsuccess = (e) => { db = e.target.result; resolve(db); };
+
+        request.onsuccess = async (e) => {
+            db = e.target.result;
+            await migrateV3toV4();
+            resolve(db);
+        };
+
         request.onerror = (e) => reject(e.target.error);
     });
 }
 
-function saveGalleryToDB(characterName, images) {
+// Migrate old flat { images: [] } records to { sets: { Default: [] }, activeSet }
+async function migrateV3toV4() {
+    return new Promise((resolve) => {
+        const tx = db.transaction(STORE_NAME, "readwrite");
+        const store = tx.objectStore(STORE_NAME);
+        const req = store.getAll();
+
+        req.onsuccess = (e) => {
+            const records = e.target.result || [];
+            let migrated = 0;
+
+            for (const record of records) {
+                if (record.images && !record.sets) {
+                    // Old schema — wrap existing images into Default set
+                    store.put({
+                        characterName: record.characterName,
+                        sets: { [DEFAULT_SET]: record.images },
+                        activeSet: DEFAULT_SET,
+                    });
+                    migrated++;
+                }
+            }
+
+            tx.oncomplete = () => {
+                if (migrated > 0) {
+                    console.log(`[Img2Img] Migrated ${migrated} gallery record(s) to sets schema.`);
+                }
+                resolve();
+            };
+        };
+
+        req.onerror = () => resolve(); // non-fatal
+    });
+}
+
+// Returns the full record: { characterName, sets, activeSet }
+function loadRecordFromDB(characterName) {
+    return new Promise((resolve, reject) => {
+        const tx = db.transaction(STORE_NAME, "readonly");
+        const store = tx.objectStore(STORE_NAME);
+        const request = store.get(characterName);
+        request.onsuccess = (e) => {
+            const result = e.target.result;
+            if (result) {
+                resolve(result);
+            } else {
+                // No record yet — return a fresh default structure
+                resolve({ characterName, sets: { [DEFAULT_SET]: [] }, activeSet: DEFAULT_SET });
+            }
+        };
+        request.onerror = (e) => reject(e.target.error);
+    });
+}
+
+function saveRecordToDB(record) {
     return new Promise((resolve, reject) => {
         const tx = db.transaction(STORE_NAME, "readwrite");
         const store = tx.objectStore(STORE_NAME);
-        const request = store.put({ characterName, images });
+        const request = store.put(record);
         request.onsuccess = () => resolve();
         request.onerror = (e) => reject(e.target.error);
     });
 }
 
-function loadGalleryFromDB(characterName) {
-    return new Promise((resolve, reject) => {
-        const tx = db.transaction(STORE_NAME, "readonly");
-        const store = tx.objectStore(STORE_NAME);
-        const request = store.get(characterName);
-        request.onsuccess = (e) => resolve(e.target.result?.images || []);
-        request.onerror = (e) => reject(e.target.error);
-    });
+// Convenience: get images for a specific set
+async function loadSetImages(characterName, setName) {
+    const record = await loadRecordFromDB(characterName);
+    return record.sets[setName] || [];
+}
+
+// Convenience: get images for the active set
+async function loadActiveSetImages(characterName) {
+    const record = await loadRecordFromDB(characterName);
+    return record.sets[record.activeSet] || [];
 }
 
 // ── Settings ──────────────────────────────────────────────────────────────────
@@ -114,7 +178,6 @@ function updateSizeDropdown(modelId) {
         $sizeSelect.append(`<option value="${s.value}" ${selected}>${s.label}</option>`);
     });
 
-    // If saved size isn't valid for this model, reset to first non-custom option
     const validMatch = sizes.find(s => s.value === currentSize);
     if (!validMatch) {
         const firstReal = sizes.find(s => s.value !== "custom") || sizes[0];
@@ -136,7 +199,6 @@ function validateAndSaveCustomSize() {
 
     if (!w || !h) return;
 
-    // Seedream on NanoGPT: each dimension must be 1024–4096px
     if (w < 1024 || w > 4096) {
         toastr.warning(`Width must be between 1024 and 4096 pixels (got ${w}).`);
         return;
@@ -233,7 +295,7 @@ async function generateImage(prompt) {
     }
 
     const charName = getCurrentCharacterName();
-    const referenceImages = charName ? await loadGalleryFromDB(charName) : [];
+    const referenceImages = charName ? await loadActiveSetImages(charName) : [];
 
     console.log(`[Img2Img] Generating — prompt: "${prompt}", model: ${settings.model}, size: ${settings.image_size}, refs: ${referenceImages.length}`);
 
@@ -306,41 +368,141 @@ async function handleGenerateCommand(namedArgs, unnamedValue) {
 
 async function renderGallery() {
     const charName = getCurrentCharacterName();
-    const $gallery = $("#img2img_gallery");
-    const $label = $("#img2img_gallery_label");
+    const $container = $("#img2img_gallery_container");
 
-    $gallery.empty();
+    $container.empty();
 
     if (!charName) {
-        $label.text("No character selected — open a chat first.");
+        $container.append(`<p class="img2img_muted">No character selected — open a chat first.</p>`);
         return;
     }
 
-    $label.text(`Reference images for: ${charName}`);
-    const images = await loadGalleryFromDB(charName);
+    const record = await loadRecordFromDB(charName);
+    const setNames = Object.keys(record.sets);
+    const activeSet = record.activeSet;
 
-    if (images.length === 0) {
-        $gallery.append(`<p class="img2img_empty">No reference images yet. Upload some below!</p>`);
-        return;
-    }
+    // ── Set selector row ──
+    const $setRow = $(`<div class="img2img_set_row"></div>`);
 
-    images.forEach((dataUrl, index) => {
-        const $thumb = $(`
-            <div class="img2img_thumb">
-                <img src="${dataUrl}" title="Reference image ${index + 1}" />
-                <button class="img2img_delete_btn" data-index="${index}" title="Remove">✕</button>
-            </div>
-        `);
-        $gallery.append($thumb);
+    // Dropdown of existing sets
+    const $setSelect = $(`<select class="text_pole img2img_set_select"></select>`);
+    setNames.forEach(name => {
+        const selected = name === activeSet ? "selected" : "";
+        $setSelect.append(`<option value="${name}" ${selected}>${name} (${record.sets[name].length})</option>`);
     });
 
-    $(".img2img_delete_btn").on("click", async function () {
-        const index = parseInt($(this).data("index"));
-        const images = await loadGalleryFromDB(charName);
-        images.splice(index, 1);
-        await saveGalleryToDB(charName, images);
+    // New set button
+    const $newBtn = $(`<button class="menu_button img2img_icon_btn" title="New set">＋</button>`);
+
+    // Rename set button
+    const $renameBtn = $(`<button class="menu_button img2img_icon_btn" title="Rename set">✏️</button>`);
+
+    // Delete set button (disabled if only one set remains)
+    const $deleteBtn = $(`<button class="menu_button img2img_icon_btn" title="Delete set"
+        ${setNames.length <= 1 ? "disabled" : ""}>🗑️</button>`);
+
+    $setRow.append($setSelect, $newBtn, $renameBtn, $deleteBtn);
+    $container.append($setRow);
+
+    // ── Image count note ──
+    const imgCount = record.sets[activeSet]?.length || 0;
+    const $countNote = $(`<small class="img2img_muted">${imgCount} image${imgCount !== 1 ? "s" : ""} in this set.</small>`);
+    $container.append($countNote);
+
+    // ── Thumbnails ──
+    const $gallery = $(`<div id="img2img_gallery"></div>`);
+    $container.append($gallery);
+
+    if (imgCount === 0) {
+        $gallery.append(`<p class="img2img_empty">No images yet. Upload some below!</p>`);
+    } else {
+        record.sets[activeSet].forEach((dataUrl, index) => {
+            const $thumb = $(`
+                <div class="img2img_thumb">
+                    <img src="${dataUrl}" title="Image ${index + 1}" />
+                    <button class="img2img_delete_btn" data-index="${index}" title="Remove">✕</button>
+                </div>
+            `);
+            $gallery.append($thumb);
+        });
+
+        $gallery.find(".img2img_delete_btn").on("click", async function () {
+            const index = parseInt($(this).data("index"));
+            const rec = await loadRecordFromDB(charName);
+            rec.sets[rec.activeSet].splice(index, 1);
+            await saveRecordToDB(rec);
+            renderGallery();
+        });
+    }
+
+    // ── Set selector: switch active set ──
+    $setSelect.on("change", async function () {
+        const rec = await loadRecordFromDB(charName);
+        rec.activeSet = $(this).val();
+        await saveRecordToDB(rec);
         renderGallery();
     });
+
+    // ── New set ──
+    $newBtn.on("click", async () => {
+        const name = prompt_input("Name for new set:", "New Set");
+        if (!name || !name.trim()) return;
+        const trimmed = name.trim();
+
+        const rec = await loadRecordFromDB(charName);
+        if (rec.sets[trimmed]) {
+            toastr.warning(`A set named "${trimmed}" already exists.`);
+            return;
+        }
+
+        rec.sets[trimmed] = [];
+        rec.activeSet = trimmed;
+        await saveRecordToDB(rec);
+        toastr.success(`Set "${trimmed}" created.`);
+        renderGallery();
+    });
+
+    // ── Rename set ──
+    $renameBtn.on("click", async () => {
+        const rec = await loadRecordFromDB(charName);
+        const oldName = rec.activeSet;
+        const newName = prompt_input("Rename set:", oldName);
+        if (!newName || !newName.trim() || newName.trim() === oldName) return;
+        const trimmed = newName.trim();
+
+        if (rec.sets[trimmed]) {
+            toastr.warning(`A set named "${trimmed}" already exists.`);
+            return;
+        }
+
+        rec.sets[trimmed] = rec.sets[oldName];
+        delete rec.sets[oldName];
+        rec.activeSet = trimmed;
+        await saveRecordToDB(rec);
+        toastr.success(`Set renamed to "${trimmed}".`);
+        renderGallery();
+    });
+
+    // ── Delete set ──
+    $deleteBtn.on("click", async () => {
+        const rec = await loadRecordFromDB(charName);
+        const setNames = Object.keys(rec.sets);
+        if (setNames.length <= 1) return; // shouldn't be reachable, button is disabled
+
+        const toDelete = rec.activeSet;
+        if (!confirm(`Delete set "${toDelete}" and all its images?`)) return;
+
+        delete rec.sets[toDelete];
+        rec.activeSet = Object.keys(rec.sets)[0];
+        await saveRecordToDB(rec);
+        toastr.success(`Set "${toDelete}" deleted.`);
+        renderGallery();
+    });
+}
+
+// Thin wrapper around window.prompt to keep things testable / replaceable later
+function prompt_input(message, defaultValue) {
+    return window.prompt(message, defaultValue);
 }
 
 // ── File upload ───────────────────────────────────────────────────────────────
@@ -352,7 +514,8 @@ async function handleImageUpload(files) {
         return;
     }
 
-    const current = await loadGalleryFromDB(charName);
+    const record = await loadRecordFromDB(charName);
+    const activeSet = record.activeSet;
 
     const readFile = (file) => new Promise((resolve, reject) => {
         const reader = new FileReader();
@@ -364,12 +527,12 @@ async function handleImageUpload(files) {
     for (const file of files) {
         if (!file.type.startsWith("image/")) continue;
         const dataUrl = await readFile(file);
-        current.push(dataUrl);
-        console.log("[Img2Img] Added reference image:", file.name);
+        record.sets[activeSet].push(dataUrl);
+        console.log(`[Img2Img] Added image to set "${activeSet}":`, file.name);
     }
 
-    await saveGalleryToDB(charName, current);
-    console.log("[Img2Img] Reference gallery saved. Total:", current.length);
+    await saveRecordToDB(record);
+    console.log(`[Img2Img] Set "${activeSet}" saved. Total: ${record.sets[activeSet].length}`);
     renderGallery();
 }
 
@@ -420,13 +583,10 @@ function renderSettingsPanel() {
 
             <hr />
 
-            <div id="img2img_gallery_label" class="img2img_section_label">
-                Open a chat to manage reference images.
-            </div>
-            <div id="img2img_gallery"></div>
+            <div id="img2img_gallery_container"></div>
 
-            <label class="img2img_upload_btn" for="img2img_upload_input">
-                ＋ Upload Reference Images
+            <label class="img2img_upload_btn" for="img2img_upload_input" style="margin-top:8px;">
+                ＋ Upload to Active Set
                 <input type="file"
                        id="img2img_upload_input"
                        accept="image/*"
@@ -442,13 +602,11 @@ function renderSettingsPanel() {
     `;
     $("#extensions_settings").append(html);
 
-    // ── API key ──
     $("#img2img_api_key").on("input", function () {
         getSettings().api_key = $(this).val();
         saveSettingsDebounced();
     });
 
-    // ── Model ID ──
     $("#img2img_model").on("input", function () {
         const modelId = $(this).val().trim();
         getSettings().model = modelId;
@@ -456,7 +614,6 @@ function renderSettingsPanel() {
         updateSizeDropdown(modelId);
     });
 
-    // ── Size select ──
     $("#img2img_size").on("change", function () {
         const val = $(this).val();
         toggleCustomSizeInputs(val === "custom");
@@ -466,10 +623,8 @@ function renderSettingsPanel() {
         }
     });
 
-    // ── Custom size inputs — save on blur ──
     $("#img2img_custom_w, #img2img_custom_h").on("change", validateAndSaveCustomSize);
 
-    // ── File upload ──
     $("#img2img_upload_input").on("change", function () {
         const files = Array.from(this.files);
         this.value = "";
@@ -500,10 +655,10 @@ jQuery(async () => {
         "img2img",
         handleGenerateCommand,
         [],
-        "Generate an image using your character's reference gallery. Usage: /img2img a girl standing in a forest",
+        "Generate an image using your character's active reference set. Usage: /img2img a girl standing in a forest",
         true,
         true
     );
 
-    console.log("[Img2Img] Extension ready (v0.9.1). Use /img2img [prompt] to generate.");
+    console.log("[Img2Img] Extension ready (v0.10.0). Use /img2img [prompt] to generate.");
 });

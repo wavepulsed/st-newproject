@@ -118,7 +118,6 @@ async function injectImageIntoChat(localPath, prompt) {
         is_system: true,
         send_date: new Date().toISOString(),
         mes: messageContent,
-        // Initialise swipes properly so ST shows 1/1 and regen works
         swipes: [messageContent],
         swipe_id: 0,
         swipe_info: [{
@@ -130,34 +129,19 @@ async function injectImageIntoChat(localPath, prompt) {
         extra: {
             isSmallSys: false,
             img2img: true,
+            image: localPath,  // ST uses extra.image for swipe regeneration
         },
     };
 
     context.chat.push(message);
     const messageIndex = context.chat.length - 1;
 
-    await addOneMessage(message, { type: "narrator", insertAt: messageIndex });
+    // Use "normal" type instead of "narrator" so ST builds the full
+    // mes_text wrapper structure that swipe and lightbox handlers expect
+    await addOneMessage(message, { type: "normal", insertAt: messageIndex });
 
-    // Trigger ST's image lightbox binding on the newly rendered message
-    // ST uses this to attach zoom/lightbox handlers to images in chat
-    const $newMessage = $(`#chat .mes[mesid="${messageIndex}"]`);
-    if ($newMessage.length) {
-        $newMessage.find("img").addClass("img_enlarged_thumb");
-        $newMessage.find("img").on("click", function () {
-            const src = $(this).attr("src");
-            const $overlay = $(`
-                <div id="img2img_lightbox" style="
-                    position:fixed; inset:0; background:rgba(0,0,0,0.85);
-                    display:flex; align-items:center; justify-content:center;
-                    z-index:9999; cursor:zoom-out;">
-                    <img src="${src}" style="max-width:90vw; max-height:90vh;
-                        border-radius:8px; box-shadow:0 8px 32px rgba(0,0,0,0.5);" />
-                </div>
-            `);
-            $overlay.on("click", () => $overlay.remove());
-            $("body").append($overlay);
-        });
-    }
+    // Do NOT add our own click handler — img_enlarged_thumb is already
+    // added by ST automatically and its native handler takes over
 
     await saveChatDebounced();
     $("#chat").scrollTop($("#chat")[0].scrollHeight);

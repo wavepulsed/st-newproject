@@ -588,7 +588,7 @@ function injectWidgetStyles() {
         .img2img_wgt_iconbtn:hover { opacity: 1; background: rgba(255,255,255,0.12); }
         .img2img_wgt_iconbtn:disabled { opacity: 0.25; pointer-events: none; }
         #img2img_widget_prompt {
-            width: 100%; resize: vertical; min-height: 78px;
+            width: 100%; resize: none; min-height: 96px; box-sizing: border-box;
             font-size: 0.81em; padding: 8px;
             background: rgba(0,0,0,0.22);
             border: 1px solid rgba(255,255,255,0.075);
@@ -598,6 +598,15 @@ function injectWidgetStyles() {
         #img2img_widget_prompt:focus {
             border-color: rgba(155,114,232,0.45); outline: none;
         }
+        #img2img_widget_resize_grip {
+            width: 100%; height: 7px; cursor: ns-resize;
+            display: flex; align-items: center; justify-content: center;
+            margin-top: -1px; margin-bottom: 2px; flex-shrink: 0;
+            opacity: 0.35; transition: opacity 0.15s;
+            user-select: none;
+        }
+        #img2img_widget_resize_grip:hover { opacity: 0.75; }
+        #img2img_widget_resize_grip svg { pointer-events: none; }
         .img2img_widget_buttons { display: flex; gap: 6px; }
         #img2img_widget_autofill {
             flex: 1; font-size: 0.79em; padding: 6px 4px;
@@ -670,6 +679,9 @@ function createFloatingWidget() {
 
                 <textarea id="img2img_widget_prompt"
                           placeholder="Type a prompt, or click Auto-fill…"></textarea>
+                <div id="img2img_widget_resize_grip">
+                    <svg width="36" height="4" viewBox="0 0 36 4"><rect y="0" width="36" height="1.5" rx="1" fill="white"/><rect y="2.5" width="36" height="1.5" rx="1" fill="white"/></svg>
+                </div>
 
                 <div class="img2img_widget_buttons">
                     <button id="img2img_widget_autofill"  title="Generate prompt from current scene">↺  Auto-fill</button>
@@ -761,6 +773,9 @@ function createFloatingWidget() {
     // ── Drag ──
     initWidgetDrag($container, $("#img2img_widget_handle"), $fab);
 
+    // ── Textarea resize ──
+    initTextareaResize($container, $("#img2img_widget_resize_grip"), $("#img2img_widget_prompt"));
+
     // ── Initial state ──
     refreshWidgetState();
 }
@@ -829,6 +844,39 @@ async function widgetGenerate() {
     } finally {
         $btn.prop("disabled", false).text("▶  Generate");
     }
+}
+
+function initTextareaResize($container, $grip, $textarea) {
+    let resizing  = false;
+    let startY, startH, startBottom;
+
+    $grip.on("mousedown", (e) => {
+        resizing    = true;
+        startY      = e.clientY;
+        startH      = $textarea.outerHeight();
+        startBottom = parseInt($container.css("bottom")) || 80;
+        e.preventDefault();
+        e.stopPropagation(); // don't trigger widget drag
+    });
+
+    $(document).on("mousemove.img2img_resize", (e) => {
+        if (!resizing) return;
+        const delta  = e.clientY - startY;
+        const newH   = Math.max(60, startH + delta);
+        const newBottom = Math.max(0, startBottom - delta);
+        $textarea.css("min-height", newH + "px").css("height", newH + "px");
+        $container.css("bottom", newBottom + "px");
+    });
+
+    $(document).on("mouseup.img2img_resize", () => {
+        if (!resizing) return;
+        resizing = false;
+        getSettings().widget_position = {
+            right:  parseInt($container.css("right"))  || 20,
+            bottom: parseInt($container.css("bottom")) || 80,
+        };
+        saveSettingsDebounced();
+    });
 }
 
 function initWidgetDrag($container, $handle, $fab) {

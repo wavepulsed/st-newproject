@@ -109,14 +109,15 @@ async function fetchAndSaveImage(remoteUrl, characterName) {
 
 async function injectImageIntoChat(localPath, prompt) {
     const context = getContext();
+    const encodedPath = encodeURI(localPath);
 
     const message = {
         name: context.name2 || "Img2Img",
         is_user: false,
-        is_system: true,
+        is_system: false,           // false → full event handlers attached
         send_date: new Date().toISOString(),
-        mes: "",                    // empty — image comes from extra.image, not markdown
-        swipes: [""],
+        mes: `![${prompt}](${encodedPath})`,   // ensures persistence on reload
+        swipes: [`![${prompt}](${encodedPath})`],
         swipe_id: 0,
         swipe_info: [{
             send_date: new Date().toISOString(),
@@ -127,8 +128,8 @@ async function injectImageIntoChat(localPath, prompt) {
         extra: {
             isSmallSys: false,
             img2img: true,
-            image: localPath,       // ST's image renderer picks this up
-            title: prompt,          // shown as caption/alt
+            image: localPath,       // primary renderer, prevents double-render
+            title: prompt,
         },
     };
 
@@ -137,7 +138,6 @@ async function injectImageIntoChat(localPath, prompt) {
     await saveChatDebounced();
     $("#chat").scrollTop($("#chat")[0].scrollHeight);
 }
-
 // ── Loading indicator ─────────────────────────────────────────────────────────
 
 function showLoadingMessage() {

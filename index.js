@@ -1,18 +1,18 @@
 // Img2Img Reference Generator for SillyTavern
-// Version 0.6.0 — Proper persistence via chatMetadata + IndexedDB
+// Version 0.7.0 — Native ST filesystem integration via saveBase64AsFile
 
 import { extension_settings, getContext } from "../../../extensions.js";
 import { saveSettingsDebounced, eventSource, event_types } from "../../../../script.js";
 import { registerSlashCommand } from "../../../slash-commands.js";
+import { saveBase64AsFile } from "../../../../scripts/utils.js";
 
 const extensionName = "st-img2img";
 const NANO_API_URL = "https://nano-gpt.com/api/v1/images/generations";
 const DB_NAME = "img2img_gallery_db";
 const DB_VERSION = 3;
 const STORE_NAME = "galleries";
-const HISTORY_STORE = "image_history";
 
-// ── IndexedDB ─────────────────────────────────────────────────────────────────
+// ── IndexedDB (reference image gallery only) ──────────────────────────────────
 
 let db = null;
 
@@ -23,13 +23,6 @@ function openDatabase() {
             const database = e.target.result;
             if (!database.objectStoreNames.contains(STORE_NAME)) {
                 database.createObjectStore(STORE_NAME, { keyPath: "characterName" });
-            }
-            if (!database.objectStoreNames.contains(HISTORY_STORE)) {
-                const store = database.createObjectStore(HISTORY_STORE, {
-                    keyPath: "id",
-                    autoIncrement: true,
-                });
-                store.createIndex("characterName", "characterName", { unique: false });
             }
         };
         request.onsuccess = (e) => { db = e.target.result; resolve(db); };
@@ -53,31 +46,6 @@ function loadGalleryFromDB(characterName) {
         const store = tx.objectStore(STORE_NAME);
         const request = store.get(characterName);
         request.onsuccess = (e) => resolve(e.target.result?.images || []);
-        request.onerror = (e) => reject(e.target.error);
-    });
-}
-
-function saveImageToDB(base64, prompt, characterName) {
-    return new Promise((resolve, reject) => {
-        const tx = db.transaction(HISTORY_STORE, "readwrite");
-        const store = tx.objectStore(HISTORY_STORE);
-        const request = store.add({
-            base64,
-            prompt,
-            characterName: characterName || "Unknown",
-            timestamp: Date.now(),
-        });
-        request.onsuccess = (e) => resolve(e.target.result); // returns the auto-increment ID
-        request.onerror = (e) => reject(e.target.error);
-    });
-}
-
-function loadImageFromDB(id) {
-    return new Promise((resolve, reject) => {
-        const tx = db.transaction(HISTORY_STORE, "readonly");
-        const store = tx.objectStore(HISTORY_STORE);
-        const request = store.get(id);
-        request.onsuccess = (e) => resolve(e.target.result || null);
         request.onerror = (e) => reject(e.target.error);
     });
 }
@@ -109,39 +77,52 @@ function getCurrentCharacterName() {
     return context?.name2 || null;
 }
 
-// ── Image fetch + persist ─────────────────────────────────────────────────────
+// ── Image fetch + save to ST filesystem ──────────────────────────────────────
 
-async function fetchAndStoreImage(remoteUrl, prompt, characterName) {
-    console.log("[Img2Img] Fetching image for local persistence...");
+async function fetchAndSaveImage(remoteUrl, characterName) {
+    console.log("[Img2Img] Fetching image from CDN...");
+
     const response = await fetch(remoteUrl);
     if (!response.ok) throw new Error(`Failed to fetch image: ${response.status}`);
-    const blob = await response.blob();
 
+    const blob = await response.blob();
+    const mimeType = blob.type || "image/jpeg";
+    const ext = mimeType.split("/")[1] || "jpg";
+
+    // Convert blob to raw base64 (no data: prefix — that's what saveBase64AsFile expects)
     const base64 = await new Promise((resolve, reject) => {
         const reader = new FileReader();
-        reader.onload = (e) => resolve(e.target.result);
+        reader.onload = (e) => {
+            // Strip the "data:image/jpeg;base64," prefix
+            const result = e.target.result;
+            resolve(result.split(",")[1]);
+        };
         reader.onerror = reject;
         reader.readAsDataURL(blob);
     });
 
-    const id = await saveImageToDB(base64, prompt, characterName);
-    console.log("[Img2Img] Image stored in IndexedDB with ID:", id);
-    return { base64, id };
+    const fileName = `img2img_${Date.now()}`;
+
+    // saveBase64AsFile(base64, characterName, fileName, extension)
+    // Returns a local URL like /user/images/CharacterName/img2img_123456.jpg
+    const localUrl = await saveBase64AsFile(base64, characterName || "img2img", fileName, ext);
+    console.log("[Img2Img] Image saved to ST filesystem:", localUrl);
+
+    return localUrl;
 }
 
 // ── Chat injection ────────────────────────────────────────────────────────────
 
-function injectImageIntoChat(base64, prompt, imageId) {
-    // Build the message with a data attribute storing the IndexedDB ID
-    // so we can restore it after page refresh
+function injectImageIntoChat(localUrl, prompt) {
     const $msg = $(`
-        <div class="mes system_mes img2img_result_msg" data-img2img-id="${imageId}">
+        <div class="mes system_mes img2img_result_msg" data-localurl="${localUrl}">
             <div class="mes_block">
                 <div class="mes_text">
-                    <img src="${base64}"
+                    <img src="${localUrl}"
                          alt="${prompt}"
                          class="img2img_generated"
                          style="max-width:100%; border-radius:8px; cursor:pointer;"
+                         onclick="window.open('${localUrl}', '_blank')"
                          title="Click to open full size" />
                     <div class="img2img_prompt_label">🖼️ ${prompt}</div>
                 </div>
@@ -149,35 +130,22 @@ function injectImageIntoChat(base64, prompt, imageId) {
         </div>
     `);
 
-    // Full-size viewer via Blob URL (works in Chrome PWA, no blank tab)
-    $msg.find("img").on("click", function () {
-        const src = this.src;
-        // Convert base64 to blob and open as object URL
-        fetch(src)
-            .then(r => r.blob())
-            .then(blob => {
-                const url = URL.createObjectURL(blob);
-                window.open(url, "_blank");
-            });
-    });
-
     $("#chat").append($msg);
     $("#chat").scrollTop($("#chat")[0].scrollHeight);
 
-    // Save the image ID into chatMetadata so we can restore after refresh
-    persistImageIdToChat(imageId, prompt);
+    // Persist the local URL in chatMetadata for restoration after refresh
+    saveToChatMetadata(localUrl, prompt);
 }
 
-function persistImageIdToChat(imageId, prompt) {
+function saveToChatMetadata(localUrl, prompt) {
     try {
         const context = getContext();
-        if (!context?.chatMetadata) return;
-        if (!context.chatMetadata.img2img_images) {
-            context.chatMetadata.img2img_images = [];
-        }
-        context.chatMetadata.img2img_images.push({ imageId, prompt, timestamp: Date.now() });
+        const metadata = context.chatMetadata;
+        if (!metadata) return;
+        if (!metadata.img2img_images) metadata.img2img_images = [];
+        metadata.img2img_images.push({ localUrl, prompt, timestamp: Date.now() });
         context.saveMetadata();
-        console.log("[Img2Img] Image ID saved to chatMetadata:", imageId);
+        console.log("[Img2Img] Saved URL to chatMetadata:", localUrl);
     } catch (err) {
         console.warn("[Img2Img] Could not save to chatMetadata:", err);
     }
@@ -185,45 +153,31 @@ function persistImageIdToChat(imageId, prompt) {
 
 // ── Chat restore on load ──────────────────────────────────────────────────────
 
-async function restoreImagesInChat() {
+function restoreImagesInChat() {
     try {
         const context = getContext();
         const stored = context?.chatMetadata?.img2img_images;
         if (!stored || stored.length === 0) return;
 
         console.log(`[Img2Img] Restoring ${stored.length} image(s) from chatMetadata...`);
-
-        // Remove any existing restored messages to avoid duplicates
         $(".img2img_result_msg").remove();
 
         for (const entry of stored) {
-            const record = await loadImageFromDB(entry.imageId);
-            if (!record) {
-                console.warn("[Img2Img] Image ID not found in IndexedDB:", entry.imageId);
-                continue;
-            }
-
             const $msg = $(`
-                <div class="mes system_mes img2img_result_msg" data-img2img-id="${entry.imageId}">
+                <div class="mes system_mes img2img_result_msg" data-localurl="${entry.localUrl}">
                     <div class="mes_block">
                         <div class="mes_text">
-                            <img src="${record.base64}"
+                            <img src="${entry.localUrl}"
                                  alt="${entry.prompt}"
                                  class="img2img_generated"
                                  style="max-width:100%; border-radius:8px; cursor:pointer;"
+                                 onclick="window.open('${entry.localUrl}', '_blank')"
                                  title="Click to open full size" />
                             <div class="img2img_prompt_label">🖼️ ${entry.prompt}</div>
                         </div>
                     </div>
                 </div>
             `);
-
-            $msg.find("img").on("click", function () {
-                fetch(this.src)
-                    .then(r => r.blob())
-                    .then(blob => window.open(URL.createObjectURL(blob), "_blank"));
-            });
-
             $("#chat").append($msg);
         }
 
@@ -237,12 +191,7 @@ async function restoreImagesInChat() {
 // ── Loading indicator ─────────────────────────────────────────────────────────
 
 function showLoadingMessage() {
-    const $loading = $(`
-        <div id="img2img_loading" class="img2img_loading_msg">
-            ⏳ Generating image, please wait...
-        </div>
-    `);
-    $("#chat").append($loading);
+    $("#chat").append(`<div id="img2img_loading" class="img2img_loading_msg">⏳ Generating image, please wait...</div>`);
     $("#chat").scrollTop($("#chat")[0].scrollHeight);
 }
 
@@ -316,17 +265,17 @@ async function handleGenerateCommand(namedArgs, unnamedValue) {
     try {
         const charName = getCurrentCharacterName();
 
-        // 1. Generate via API
+        // 1. Generate via API, get expiring CDN URL
         const remoteUrl = await generateImage(prompt.trim());
 
-        // 2. Fetch and store locally in IndexedDB
-        const { base64, id } = await fetchAndStoreImage(remoteUrl, prompt.trim(), charName);
+        // 2. Fetch and save permanently to ST's own filesystem
+        const localUrl = await fetchAndSaveImage(remoteUrl, charName);
 
-        // 3. Inject into chat using local base64
+        // 3. Inject into chat using permanent local URL
         hideLoadingMessage();
-        injectImageIntoChat(base64, prompt.trim(), id);
+        injectImageIntoChat(localUrl, prompt.trim());
 
-        toastr.success(`Image generated and saved locally.`);
+        toastr.success(`Image generated and saved to ST gallery.`);
     } catch (err) {
         hideLoadingMessage();
         console.error("[Img2Img] Generation failed:", err);
@@ -397,11 +346,11 @@ async function handleImageUpload(files) {
         if (!file.type.startsWith("image/")) continue;
         const dataUrl = await readFile(file);
         current.push(dataUrl);
-        console.log("[Img2Img] Added:", file.name);
+        console.log("[Img2Img] Added reference image:", file.name);
     }
 
     await saveGalleryToDB(charName, current);
-    console.log("[Img2Img] Gallery saved. Total images:", current.length);
+    console.log("[Img2Img] Reference gallery saved. Total:", current.length);
     renderGallery();
 }
 
@@ -489,7 +438,6 @@ function renderSettingsPanel() {
 function registerEvents() {
     eventSource.on(event_types.CHAT_CHANGED, () => {
         renderGallery();
-        // Small delay to let ST finish rendering the chat before we restore
         setTimeout(restoreImagesInChat, 500);
     });
 }
@@ -511,7 +459,6 @@ jQuery(async () => {
         true
     );
 
-    // Restore any images from the current chat on initial load
     setTimeout(restoreImagesInChat, 1000);
 
     console.log("[Img2Img] Extension ready. Use /img2img [prompt] to generate.");

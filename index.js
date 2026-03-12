@@ -115,7 +115,7 @@ async function injectImageIntoChat(localPath, prompt) {
         is_user: false,
         is_system: false,           // enables click/button handlers
         send_date: new Date().toISOString(),
-        mes: "",                    // empty = no markdown render path
+        mes: "",                    // empty = no markdown render path, no double image
         swipes: [""],
         swipe_id: 0,
         swipe_info: [{
@@ -127,12 +127,14 @@ async function injectImageIntoChat(localPath, prompt) {
         extra: {
             isSmallSys: false,
             img2img: true,
-            image: localPath,       // sole render path via extra.image
+            image: localPath,       // sole render path
             title: prompt,
         },
     };
 
-    await addOneMessage(message, { type: "normal" });
+    context.chat.push(message);                          // data model first
+    const messageIndex = context.chat.length - 1;
+    await addOneMessage(message, { type: "normal", insertAt: messageIndex }); // render only
 
     await saveChatDebounced();
     $("#chat").scrollTop($("#chat")[0].scrollHeight);

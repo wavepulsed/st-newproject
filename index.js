@@ -132,8 +132,8 @@ async function injectImageIntoChat(localPath, prompt) {
         },
     };
 
-    const messageIndex = context.chat.length;
-    await addOneMessage(message, { type: "normal", insertAt: messageIndex });
+    // No insertAt — let addOneMessage handle positioning itself
+    await addOneMessage(message, { type: "normal" });
 
     await saveChatDebounced();
     $("#chat").scrollTop($("#chat")[0].scrollHeight);

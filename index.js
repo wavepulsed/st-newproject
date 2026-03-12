@@ -1,19 +1,29 @@
 // Img2Img Reference Generator for SillyTavern
-// Version 0.11.0 — Auto-prompt, prefix/suffix, preview modal
+// Version 0.12.0 — Direct NanoGPT chat for auto-prompt (no ST context bleed)
 
 import { extension_settings, getContext } from "../../../extensions.js";
-import { saveSettingsDebounced, eventSource, event_types, saveChatDebounced, addOneMessage, generateQuietPrompt } from "../../../../script.js";
+import { saveSettingsDebounced, eventSource, event_types, saveChatDebounced, addOneMessage } from "../../../../script.js";
 import { registerSlashCommand } from "../../../slash-commands.js";
 import { saveBase64AsFile } from "../../../../scripts/utils.js";
 
 const extensionName = "st-img2img";
-const NANO_API_URL = "https://nano-gpt.com/api/v1/images/generations";
+const NANO_API_URL  = "https://nano-gpt.com/api/v1/images/generations";
+const NANO_CHAT_URL = "https://nano-gpt.com/api/v1/chat/completions";
 const DB_NAME = "img2img_gallery_db";
 const DB_VERSION = 4;
 const STORE_NAME = "galleries";
 const DEFAULT_SET = "Default";
 
-const DEFAULT_AUTO_PROMPT_TEMPLATE = `Based on the current scene, write a concise image generation prompt describing the visual. Focus on: character appearance, pose, expression, clothing, setting, and lighting. Reply with only the image prompt — no explanation, no preamble, no punctuation at the end.`;
+const DEFAULT_AUTO_PROMPT_TEMPLATE =
+`You are an image prompt generator. Your entire output must be a single image generation prompt — nothing else.
+
+Rules:
+- Do NOT use any character names. Describe every person purely by their physical appearance: hair colour and style, eye colour, build, clothing, expression, and pose.
+- Any characters not covered by uploaded reference images must be described in full visual detail.
+- Describe the environment: location, lighting, time of day, atmosphere, mood.
+- Include composition feel where relevant: close-up, wide shot, dynamic angle, etc.
+- No narration, no dialogue, no explanation, no preamble, no sign-off.
+- Output the prompt only. One paragraph. No bullet points.`;
 
 // ── Size map per model ────────────────────────────────────────────────────────
 
@@ -149,6 +159,8 @@ const defaultSettings = {
     global_suffix: "",
     auto_prompt_template: DEFAULT_AUTO_PROMPT_TEMPLATE,
     auto_prompt_preview: true,
+    auto_prompt_model: "gpt-4o-mini",
+    auto_prompt_context_messages: 10,
 };
 
 function loadSettings() {
@@ -211,17 +223,71 @@ function stripPreamble(text) {
 
 // ── Auto-prompt from chat context ─────────────────────────────────────────────
 
-async function generateAutoPrompt() {
-    const template = getSettings().auto_prompt_template || DEFAULT_AUTO_PROMPT_TEMPLATE;
+function buildChatContext(numMessages) {
+    const context = getContext();
+    const chat = context?.chat || [];
 
-    toastr.info("Generating scene description…", "", { timeOut: 2000 });
+    // Grab the last N real messages, skipping our own injected images
+    const recent = chat
+        .filter(m => !m.extra?.img2img)
+        .slice(-numMessages);
+
+    if (recent.length === 0) return "(No recent messages available.)";
+
+    return recent.map(m => {
+        const speaker = m.is_user ? "User" : (m.name || "Character");
+        const text = (m.mes || "").trim();
+        return text ? `${speaker}: ${text}` : null;
+    }).filter(Boolean).join("\n");
+}
+
+async function generateAutoPrompt() {
+    const settings = getSettings();
+    const template  = settings.auto_prompt_template || DEFAULT_AUTO_PROMPT_TEMPLATE;
+    const chatModel = settings.auto_prompt_model    || "gpt-4o-mini";
+    const numMsgs   = settings.auto_prompt_context_messages ?? 10;
+
+    if (!settings.api_key) {
+        throw new Error("No API key set — cannot generate auto-prompt.");
+    }
+
+    toastr.info("Generating scene description…", "", { timeOut: 3000 });
+
+    const chatContext = buildChatContext(numMsgs);
+
+    const messages = [
+        { role: "system", content: template },
+        { role: "user",   content: `Here are the last ${numMsgs} messages from the current scene:\n\n${chatContext}\n\nWrite the image generation prompt now.` },
+    ];
 
     try {
-        const rawPrompt = await generateQuietPrompt(template, false, false);
-        if (!rawPrompt || !rawPrompt.trim()) {
-            throw new Error("Empty response from chat API.");
+        const response = await fetch(NANO_CHAT_URL, {
+            method: "POST",
+            headers: {
+                "Authorization": `Bearer ${settings.api_key}`,
+                "Content-Type": "application/json",
+            },
+            body: JSON.stringify({
+                model: chatModel,
+                messages,
+                max_tokens: 400,
+                temperature: 0.4,
+            }),
+        });
+
+        if (!response.ok) {
+            const err = await response.text();
+            throw new Error(`NanoGPT chat API error ${response.status}: ${err}`);
         }
-        return stripPreamble(rawPrompt);
+
+        const data = await response.json();
+        const raw  = data?.choices?.[0]?.message?.content;
+
+        if (!raw || !raw.trim()) {
+            throw new Error("Empty response from chat model.");
+        }
+
+        return stripPreamble(raw);
     } catch (err) {
         throw new Error(`Auto-prompt failed: ${err.message}`);
     }
@@ -743,13 +809,29 @@ function renderSettingsPanel() {
 
             <hr />
 
-            <label>Auto-Prompt Template</label>
+            <label>Auto-Prompt Chat Model</label>
+            <input type="text"
+                   id="img2img_auto_model"
+                   class="text_pole"
+                   placeholder="e.g. gpt-4o-mini, claude-haiku-4-5-20251001"
+                   value="${settings.auto_prompt_model}" />
+            <small>The model used <em>only</em> for generating the image prompt — separate from your main chat model. Uses your NanoGPT key. A fast, cheap model like gpt-4o-mini works well here.</small>
+
+            <label style="margin-top:10px;">Context Messages</label>
+            <input type="number"
+                   id="img2img_auto_context"
+                   class="text_pole"
+                   min="1" max="50"
+                   value="${settings.auto_prompt_context_messages}" />
+            <small>How many recent chat messages to send as scene context. 6–12 is usually enough.</small>
+
+            <label style="margin-top:10px;">Auto-Prompt Template</label>
             <textarea id="img2img_auto_template"
                       class="text_pole"
-                      rows="4"
-                      placeholder="Instruction sent to your chat API when /img2img is used with no prompt."
+                      rows="6"
+                      placeholder="System instruction for the auto-prompt model."
             >${settings.auto_prompt_template}</textarea>
-            <small>Sent to your main chat API to generate a scene description. The result becomes the image prompt.</small>
+            <small>Sent as the system prompt to your auto-prompt model. It receives this + the last N chat messages as context.</small>
 
             <div style="display:flex; align-items:center; gap:8px; margin-top:10px;">
                 <input type="checkbox"
@@ -815,6 +897,19 @@ function renderSettingsPanel() {
         saveSettingsDebounced();
     });
 
+    $("#img2img_auto_model").on("input", function () {
+        getSettings().auto_prompt_model = $(this).val().trim();
+        saveSettingsDebounced();
+    });
+
+    $("#img2img_auto_context").on("change", function () {
+        const val = parseInt($(this).val());
+        if (val >= 1 && val <= 50) {
+            getSettings().auto_prompt_context_messages = val;
+            saveSettingsDebounced();
+        }
+    });
+
     $("#img2img_auto_template").on("input", function () {
         getSettings().auto_prompt_template = $(this).val();
         saveSettingsDebounced();
@@ -860,5 +955,5 @@ jQuery(async () => {
         true
     );
 
-    console.log("[Img2Img] Extension ready (v0.11.0). /img2img [prompt] or /img2img for auto-prompt.");
+    console.log("[Img2Img] Extension ready (v0.12.0). /img2img [prompt] or /img2img for auto-prompt.");
 });

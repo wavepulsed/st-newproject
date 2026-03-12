@@ -101,6 +101,7 @@ async function fetchAndSaveImage(remoteUrl, characterName) {
     const fileName = `img2img_${Date.now()}`;
 
     const localUrl = await saveBase64AsFile(base64, characterName || "img2img", fileName, ext);
+    console.log("[Img2Img] Raw local URL:", localUrl);
     console.log("[Img2Img] Image saved to ST filesystem:", localUrl);
 
     return localUrl;
@@ -114,7 +115,7 @@ async function injectImageIntoChat(localPath, prompt) {
         is_user: false,
         is_system: true,
         send_date: new Date().toISOString(),
-        mes: `![${prompt}](${localPath})`,
+       mes: `![${prompt}](${encodeURI(localPath)})`,
         extra: {
             isSmallSys: false,
             img2img: true,

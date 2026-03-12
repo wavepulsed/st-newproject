@@ -1,5 +1,5 @@
 // Img2Img Reference Generator for SillyTavern
-// Version 0.13.0 — Draggable floating widget with custom icon
+// Version 0.13.1 — Drag fixes, Set Manager modal
 
 import { extension_settings, getContext } from "../../../extensions.js";
 import { saveSettingsDebounced, eventSource, event_types, saveChatDebounced, addOneMessage } from "../../../../script.js";
@@ -659,9 +659,7 @@ function createFloatingWidget() {
                 <div class="img2img_widget_row">
                     <span class="img2img_widget_label">Set</span>
                     <select id="img2img_widget_set" class="img2img_widget_select"></select>
-                    <button class="img2img_wgt_iconbtn" id="img2img_wgt_new_set"    title="New set">＋</button>
-                    <button class="img2img_wgt_iconbtn" id="img2img_wgt_rename_set" title="Rename set">✏️</button>
-                    <button class="img2img_wgt_iconbtn" id="img2img_wgt_delete_set" title="Delete set">🗑️</button>
+                    <button class="img2img_wgt_iconbtn" id="img2img_wgt_manage_sets" title="Manage sets">⚙ Manage</button>
                 </div>
 
                 <div class="img2img_widget_row">
@@ -734,54 +732,9 @@ function createFloatingWidget() {
         }
     });
 
-    // ── Set management ──
-    $("#img2img_wgt_new_set").on("click", async () => {
-        const charName = getCurrentCharacterName();
-        if (!charName) return;
-        const name = prompt_input("Name for new set:", "New Set");
-        if (!name?.trim()) return;
-        const trimmed = name.trim();
-        const rec = await loadRecordFromDB(charName);
-        if (rec.sets[trimmed]) { toastr.warning(`A set named "${trimmed}" already exists.`); return; }
-        rec.sets[trimmed] = [];
-        rec.activeSet = trimmed;
-        await saveRecordToDB(rec);
-        toastr.success(`Set "${trimmed}" created.`);
-        refreshWidgetState();
-        renderGallery();
-    });
-
-    $("#img2img_wgt_rename_set").on("click", async () => {
-        const charName = getCurrentCharacterName();
-        if (!charName) return;
-        const rec = await loadRecordFromDB(charName);
-        const oldName = rec.activeSet;
-        const newName = prompt_input("Rename set:", oldName);
-        if (!newName?.trim() || newName.trim() === oldName) return;
-        const trimmed = newName.trim();
-        if (rec.sets[trimmed]) { toastr.warning(`A set named "${trimmed}" already exists.`); return; }
-        rec.sets[trimmed] = rec.sets[oldName];
-        delete rec.sets[oldName];
-        rec.activeSet = trimmed;
-        await saveRecordToDB(rec);
-        toastr.success(`Set renamed to "${trimmed}".`);
-        refreshWidgetState();
-        renderGallery();
-    });
-
-    $("#img2img_wgt_delete_set").on("click", async () => {
-        const charName = getCurrentCharacterName();
-        if (!charName) return;
-        const rec = await loadRecordFromDB(charName);
-        if (Object.keys(rec.sets).length <= 1) return;
-        const toDelete = rec.activeSet;
-        if (!confirm(`Delete set "${toDelete}" and all its images?`)) return;
-        delete rec.sets[toDelete];
-        rec.activeSet = Object.keys(rec.sets)[0];
-        await saveRecordToDB(rec);
-        toastr.success(`Set "${toDelete}" deleted.`);
-        refreshWidgetState();
-        renderGallery();
+    // ── Set management modal ──
+    $("#img2img_wgt_manage_sets").on("click", () => {
+        openSetManager();
     });
 
     // ── Icon customization ──
@@ -805,7 +758,7 @@ function createFloatingWidget() {
     });
 
     // ── Drag ──
-    initWidgetDrag($container, $("#img2img_widget_handle"));
+    initWidgetDrag($container, $("#img2img_widget_handle"), $fab);
 
     // ── Initial state ──
     refreshWidgetState();
@@ -830,10 +783,8 @@ async function refreshWidgetState() {
             const selected = name === record.activeSet ? "selected" : "";
             $setSelect.append(`<option value="${name}" ${selected}>${name} (${record.sets[name].length})</option>`);
         });
-        $("#img2img_wgt_delete_set").prop("disabled", setNames.length <= 1);
     } else {
         $setSelect.append(`<option disabled>— no character —</option>`);
-        $("#img2img_wgt_delete_set").prop("disabled", true);
     }
 
     // Size dropdown (exclude "custom" — handled in settings panel)
@@ -878,25 +829,40 @@ async function widgetGenerate() {
     }
 }
 
-function initWidgetDrag($container, $handle) {
-    let dragging = false;
+function initWidgetDrag($container, $handle, $fab) {
+    let dragging  = false;
+    let didDrag   = false;
     let startX, startY, startRight, startBottom;
 
-    $handle.on("mousedown", (e) => {
-        if ($(e.target).is("button")) return;
-        dragging = true;
-        $handle.addClass("dragging");
+    function beginDrag(e) {
+        dragging  = true;
+        didDrag   = false;
         startX      = e.clientX;
         startY      = e.clientY;
         startRight  = parseInt($container.css("right"))  || 20;
         startBottom = parseInt($container.css("bottom")) || 80;
+        $handle.addClass("dragging");
         e.preventDefault();
+    }
+
+    // Drag from handle (skip close button)
+    $handle.on("mousedown", (e) => {
+        if ($(e.target).is("button")) return;
+        beginDrag(e);
+    });
+
+    // Drag from FAB — but still allow a clean click to toggle
+    $fab.on("mousedown", (e) => {
+        beginDrag(e);
     });
 
     $(document).on("mousemove.img2img_drag", (e) => {
         if (!dragging) return;
-        const newRight  = Math.max(0, startRight  - (e.clientX - startX));
-        const newBottom = Math.max(0, startBottom + (e.clientY - startY));
+        const dx = e.clientX - startX;
+        const dy = e.clientY - startY;
+        if (Math.abs(dx) > 3 || Math.abs(dy) > 3) didDrag = true;
+        const newRight  = Math.max(0, startRight  - dx);
+        const newBottom = Math.max(0, startBottom - dy);
         $container.css({ right: newRight + "px", bottom: newBottom + "px" });
     });
 
@@ -904,12 +870,350 @@ function initWidgetDrag($container, $handle) {
         if (!dragging) return;
         dragging = false;
         $handle.removeClass("dragging");
-        getSettings().widget_position = {
-            right:  parseInt($container.css("right"))  || 20,
-            bottom: parseInt($container.css("bottom")) || 80,
-        };
-        saveSettingsDebounced();
+        if (didDrag) {
+            getSettings().widget_position = {
+                right:  parseInt($container.css("right"))  || 20,
+                bottom: parseInt($container.css("bottom")) || 80,
+            };
+            saveSettingsDebounced();
+        }
     });
+
+    // Suppress the FAB click when the user was actually dragging
+    $fab.on("click.img2img_drag", (e) => {
+        if (didDrag) { e.stopImmediatePropagation(); didDrag = false; }
+    });
+}
+
+// ── Set Manager modal ────────────────────────────────────────────────────────
+
+function openSetManager() {
+    const charName = getCurrentCharacterName();
+    if (!charName) { toastr.warning("Open a character chat first."); return; }
+
+    // Inject styles once
+    if (!$("#img2img_setmgr_styles").length) {
+        $("head").append(`<style id="img2img_setmgr_styles">
+            #img2img_setmgr_overlay {
+                position: fixed; inset: 0; z-index: 10000;
+                background: rgba(0,0,0,0.62);
+                display: flex; align-items: center; justify-content: center;
+            }
+            #img2img_setmgr_modal {
+                width: 480px; max-width: 95vw; max-height: 88vh;
+                display: flex; flex-direction: column;
+                background: var(--SmartThemeBlurTintColor, #1c1b2e);
+                border: 1px solid rgba(155,114,232,0.22);
+                border-radius: 16px;
+                box-shadow: 0 18px 54px rgba(0,0,0,0.80);
+                animation: img2img_fadein 0.14s ease;
+                overflow: hidden;
+            }
+            #img2img_setmgr_header {
+                display: flex; align-items: center; justify-content: space-between;
+                padding: 14px 18px 12px;
+                background: rgba(155,114,232,0.08);
+                border-bottom: 1px solid rgba(255,255,255,0.055);
+                flex-shrink: 0;
+            }
+            #img2img_setmgr_title {
+                font-size: 0.88em; font-weight: 700;
+                letter-spacing: 0.06em;
+            }
+            #img2img_setmgr_charname {
+                font-size: 0.72em; color: rgba(155,114,232,0.75);
+                margin-top: 1px;
+            }
+            #img2img_setmgr_close {
+                background: none; border: none;
+                color: rgba(255,255,255,0.3); cursor: pointer;
+                font-size: 1.05em; padding: 0; line-height: 1;
+                transition: color 0.12s;
+            }
+            #img2img_setmgr_close:hover { color: rgba(255,255,255,0.85); }
+            #img2img_setmgr_body {
+                overflow-y: auto; padding: 14px 18px;
+                flex: 1; display: flex; flex-direction: column; gap: 14px;
+            }
+            .img2img_setmgr_section { display: flex; flex-direction: column; gap: 6px; }
+            .img2img_setmgr_section_label {
+                font-size: 0.7em; font-weight: 700;
+                text-transform: uppercase; letter-spacing: 0.1em;
+                color: rgba(255,255,255,0.3);
+            }
+            #img2img_setmgr_list {
+                display: flex; flex-direction: column; gap: 4px;
+            }
+            .img2img_setmgr_set_row {
+                display: flex; align-items: center; gap: 7px;
+                padding: 7px 10px;
+                border-radius: 8px;
+                border: 1px solid rgba(255,255,255,0.06);
+                background: rgba(255,255,255,0.03);
+                cursor: pointer;
+                transition: background 0.1s, border-color 0.1s;
+            }
+            .img2img_setmgr_set_row:hover { background: rgba(255,255,255,0.07); }
+            .img2img_setmgr_set_row.active {
+                border-color: rgba(155,114,232,0.42);
+                background: rgba(155,114,232,0.08);
+            }
+            .img2img_setmgr_set_name {
+                flex: 1; font-size: 0.84em; font-weight: 600;
+            }
+            .img2img_setmgr_set_count {
+                font-size: 0.72em; color: rgba(255,255,255,0.3);
+            }
+            .img2img_setmgr_set_btns { display: flex; gap: 4px; }
+            .img2img_setmgr_set_btn {
+                padding: 2px 7px; font-size: 0.74em;
+                background: rgba(255,255,255,0.06);
+                border: 1px solid rgba(255,255,255,0.08);
+                border-radius: 5px; cursor: pointer; color: inherit;
+                opacity: 0.55; transition: opacity 0.1s, background 0.1s;
+            }
+            .img2img_setmgr_set_btn:hover { opacity: 1; background: rgba(255,255,255,0.12); }
+            .img2img_setmgr_set_btn.danger:hover { background: rgba(220,60,60,0.22); border-color: rgba(220,60,60,0.35); opacity: 1; }
+            #img2img_setmgr_new_row {
+                display: flex; gap: 7px;
+            }
+            #img2img_setmgr_new_input {
+                flex: 1; padding: 6px 10px; font-size: 0.82em;
+                background: rgba(0,0,0,0.22);
+                border: 1px solid rgba(255,255,255,0.09);
+                border-radius: 7px; color: inherit; font-family: inherit;
+            }
+            #img2img_setmgr_new_input:focus {
+                border-color: rgba(155,114,232,0.45); outline: none;
+            }
+            #img2img_setmgr_new_btn {
+                padding: 6px 14px; font-size: 0.82em;
+                background: rgba(155,114,232,0.18);
+                border: 1px solid rgba(155,114,232,0.32);
+                border-radius: 7px; cursor: pointer; color: inherit;
+                transition: background 0.1s;
+            }
+            #img2img_setmgr_new_btn:hover { background: rgba(155,114,232,0.32); }
+            #img2img_setmgr_thumbs {
+                display: flex; flex-wrap: wrap; gap: 7px;
+                min-height: 48px;
+            }
+            .img2img_setmgr_thumb {
+                position: relative; width: 72px; height: 72px;
+                border-radius: 7px; overflow: hidden;
+                border: 1px solid rgba(255,255,255,0.08);
+                flex-shrink: 0;
+            }
+            .img2img_setmgr_thumb img {
+                width: 100%; height: 100%; object-fit: cover; display: block;
+            }
+            .img2img_setmgr_thumb_del {
+                position: absolute; top: 2px; right: 2px;
+                width: 18px; height: 18px; border-radius: 50%;
+                background: rgba(0,0,0,0.65); border: none;
+                color: rgba(255,255,255,0.7); font-size: 0.65em;
+                cursor: pointer; display: flex; align-items: center; justify-content: center;
+                opacity: 0; transition: opacity 0.15s;
+            }
+            .img2img_setmgr_thumb:hover .img2img_setmgr_thumb_del { opacity: 1; }
+            #img2img_setmgr_upload_btn {
+                width: 72px; height: 72px; border-radius: 7px;
+                border: 1.5px dashed rgba(155,114,232,0.35);
+                background: rgba(155,114,232,0.06);
+                color: rgba(155,114,232,0.6); font-size: 1.5em;
+                cursor: pointer; display: flex; align-items: center; justify-content: center;
+                flex-shrink: 0; transition: background 0.12s, border-color 0.12s;
+            }
+            #img2img_setmgr_upload_btn:hover {
+                background: rgba(155,114,232,0.14); border-color: rgba(155,114,232,0.6);
+            }
+            #img2img_setmgr_empty {
+                font-size: 0.78em; color: rgba(255,255,255,0.25);
+                padding: 4px 0;
+            }
+        </style>`);
+    }
+
+    async function renderSetMgr() {
+        const rec = await loadRecordFromDB(charName);
+        const setNames = Object.keys(rec.sets);
+
+        // Set list
+        const $list = $("#img2img_setmgr_list").empty();
+        setNames.forEach(name => {
+            const isActive = name === rec.activeSet;
+            const count = rec.sets[name].length;
+            const $row = $(`
+                <div class="img2img_setmgr_set_row${isActive ? " active" : ""}" data-set="${name}">
+                    <span class="img2img_setmgr_set_name">${name}</span>
+                    <span class="img2img_setmgr_set_count">${count} image${count !== 1 ? "s" : ""}</span>
+                    <div class="img2img_setmgr_set_btns">
+                        <button class="img2img_setmgr_set_btn rename-btn" data-set="${name}" title="Rename">✏️</button>
+                        <button class="img2img_setmgr_set_btn danger delete-btn" data-set="${name}"
+                                title="Delete" ${setNames.length <= 1 ? "disabled" : ""}>🗑️</button>
+                    </div>
+                </div>
+            `);
+
+            $row.on("click", async (e) => {
+                if ($(e.target).is("button")) return;
+                const r = await loadRecordFromDB(charName);
+                r.activeSet = name;
+                await saveRecordToDB(r);
+                refreshWidgetState();
+                renderGallery();
+                renderSetMgr();
+            });
+
+            $row.find(".rename-btn").on("click", async () => {
+                const newName = prompt_input("Rename set:", name);
+                if (!newName?.trim() || newName.trim() === name) return;
+                const trimmed = newName.trim();
+                const r = await loadRecordFromDB(charName);
+                if (r.sets[trimmed]) { toastr.warning(`"${trimmed}" already exists.`); return; }
+                r.sets[trimmed] = r.sets[name];
+                delete r.sets[name];
+                if (r.activeSet === name) r.activeSet = trimmed;
+                await saveRecordToDB(r);
+                toastr.success(`Renamed to "${trimmed}".`);
+                refreshWidgetState();
+                renderGallery();
+                renderSetMgr();
+            });
+
+            $row.find(".delete-btn").on("click", async () => {
+                if (setNames.length <= 1) return;
+                const r = await loadRecordFromDB(charName);
+                if (!confirm(`Delete set "${name}" and all ${r.sets[name].length} image(s)?`)) return;
+                delete r.sets[name];
+                if (r.activeSet === name) r.activeSet = Object.keys(r.sets)[0];
+                await saveRecordToDB(r);
+                toastr.success(`Set "${name}" deleted.`);
+                refreshWidgetState();
+                renderGallery();
+                renderSetMgr();
+            });
+
+            $list.append($row);
+        });
+
+        // Thumbnails for active set
+        const $thumbs = $("#img2img_setmgr_thumbs").empty();
+        const images = rec.sets[rec.activeSet] || [];
+
+        if (images.length === 0) {
+            $thumbs.append(`<span id="img2img_setmgr_empty">No images yet — upload some!</span>`);
+        } else {
+            images.forEach((dataUrl, idx) => {
+                const $thumb = $(`
+                    <div class="img2img_setmgr_thumb">
+                        <img src="${dataUrl}" />
+                        <button class="img2img_setmgr_thumb_del" data-idx="${idx}" title="Remove">✕</button>
+                    </div>
+                `);
+                $thumb.find(".img2img_setmgr_thumb_del").on("click", async () => {
+                    const r = await loadRecordFromDB(charName);
+                    r.sets[r.activeSet].splice(idx, 1);
+                    await saveRecordToDB(r);
+                    renderGallery();
+                    renderSetMgr();
+                });
+                $thumbs.append($thumb);
+            });
+        }
+
+        // Upload button
+        const $uploadBtn = $(`<button id="img2img_setmgr_upload_btn" title="Upload images">＋</button>`);
+        $uploadBtn.on("click", () => $("#img2img_setmgr_file_input").trigger("click"));
+        $thumbs.append($uploadBtn);
+
+        // Active set label
+        $("#img2img_setmgr_active_label").text(`Images in "${rec.activeSet}"`);
+    }
+
+    // Build modal DOM
+    $("#img2img_setmgr_overlay").remove();
+    const $overlay = $(`
+        <div id="img2img_setmgr_overlay">
+            <div id="img2img_setmgr_modal">
+                <div id="img2img_setmgr_header">
+                    <div>
+                        <div id="img2img_setmgr_title">Reference Sets</div>
+                        <div id="img2img_setmgr_charname">${charName}</div>
+                    </div>
+                    <button id="img2img_setmgr_close">✕</button>
+                </div>
+                <div id="img2img_setmgr_body">
+                    <div class="img2img_setmgr_section">
+                        <div class="img2img_setmgr_section_label">Sets — click a row to activate</div>
+                        <div id="img2img_setmgr_list"></div>
+                        <div id="img2img_setmgr_new_row">
+                            <input type="text" id="img2img_setmgr_new_input" placeholder="New set name…" />
+                            <button id="img2img_setmgr_new_btn">＋ Create</button>
+                        </div>
+                    </div>
+                    <div class="img2img_setmgr_section">
+                        <div class="img2img_setmgr_section_label" id="img2img_setmgr_active_label">Images</div>
+                        <div id="img2img_setmgr_thumbs"></div>
+                        <input type="file" id="img2img_setmgr_file_input" accept="image/*" multiple style="display:none;" />
+                    </div>
+                </div>
+            </div>
+        </div>
+    `);
+
+    $("body").append($overlay);
+
+    // Close
+    const close = () => $("#img2img_setmgr_overlay").remove();
+    $("#img2img_setmgr_close").on("click", close);
+    $("#img2img_setmgr_overlay").on("click", (e) => {
+        if ($(e.target).is("#img2img_setmgr_overlay")) close();
+    });
+
+    // Create new set
+    async function createNewSet() {
+        const name = $("#img2img_setmgr_new_input").val().trim();
+        if (!name) return;
+        const rec = await loadRecordFromDB(charName);
+        if (rec.sets[name]) { toastr.warning(`"${name}" already exists.`); return; }
+        rec.sets[name] = [];
+        rec.activeSet  = name;
+        await saveRecordToDB(rec);
+        $("#img2img_setmgr_new_input").val("");
+        toastr.success(`Set "${name}" created.`);
+        refreshWidgetState();
+        renderGallery();
+        renderSetMgr();
+    }
+
+    $("#img2img_setmgr_new_btn").on("click", createNewSet);
+    $("#img2img_setmgr_new_input").on("keydown", (e) => {
+        if (e.key === "Enter") createNewSet();
+    });
+
+    // File upload
+    $("#img2img_setmgr_file_input").on("change", async function () {
+        const files = Array.from(this.files);
+        this.value = "";
+        if (!files.length) return;
+        const rec = await loadRecordFromDB(charName);
+        const readFile = (file) => new Promise((res, rej) => {
+            const r = new FileReader();
+            r.onload  = (e) => res(e.target.result);
+            r.onerror = rej;
+            r.readAsDataURL(file);
+        });
+        for (const file of files) {
+            if (!file.type.startsWith("image/")) continue;
+            rec.sets[rec.activeSet].push(await readFile(file));
+        }
+        await saveRecordToDB(rec);
+        renderGallery();
+        renderSetMgr();
+    });
+
+    renderSetMgr();
 }
 
 // ── Gallery UI (settings panel) ───────────────────────────────────────────────
@@ -1250,5 +1554,5 @@ jQuery(async () => {
         true
     );
 
-    console.log("[Img2Img] Extension ready (v0.13.0). Floating widget active.");
+    console.log("[Img2Img] Extension ready (v0.13.1). Floating widget active.");
 });

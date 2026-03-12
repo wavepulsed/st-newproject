@@ -382,7 +382,8 @@ async function renderGallery() {
     const activeSet = record.activeSet;
 
     // ── Set selector row ──
-    const $setRow = $(`<div class="img2img_set_row"></div>`);
+    $container.append(`<label class="img2img_section_label">Sets</label>`);
+    const $setRow = $(`<div class="img2img_set_row" style="display:flex; flex-direction:row; align-items:center; gap:6px; flex-wrap:wrap;"></div>`);
 
     // Dropdown of existing sets
     const $setSelect = $(`<select class="text_pole img2img_set_select"></select>`);

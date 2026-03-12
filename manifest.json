@@ -5,8 +5,9 @@
     "optional": [],
     "js": "index.js",
     "css": "style.css",
+    "server_plugin": "server-plugin.js",
     "author": "wavepulsed",
-    "version": "0.1.0",
+    "version": "0.5.0",
     "homePage": "https://github.com/wavepulsed/st-newproject",
     "description": "Generate images using reference photos from per-character galleries via Seedream 4.5."
 }

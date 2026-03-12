@@ -1,5 +1,5 @@
 // Img2Img Reference Generator for SillyTavern
-// Version 0.9.0 — Live model list, dynamic size dropdown, custom size support
+// Version 0.9.1 — Dynamic size dropdown, custom size support
 
 import { extension_settings, getContext } from "../../../extensions.js";
 import { saveSettingsDebounced, eventSource, event_types, saveChatDebounced, addOneMessage } from "../../../../script.js";
@@ -8,14 +8,13 @@ import { saveBase64AsFile } from "../../../../scripts/utils.js";
 
 const extensionName = "st-img2img";
 const NANO_API_URL = "https://nano-gpt.com/api/v1/images/generations";
-const NANO_MODELS_URL = "https://nano-gpt.com/api/v1/models";
 const DB_NAME = "img2img_gallery_db";
 const DB_VERSION = 3;
 const STORE_NAME = "galleries";
 
 // ── Size map per model ────────────────────────────────────────────────────────
-// NanoGPT's /models endpoint doesn't include size metadata, so we maintain
-// this lookup table. Falls back to DEFAULT_SIZES for unknown models.
+// Add entries here as new models are supported.
+// Falls back to DEFAULT_SIZES for any model not listed.
 
 const MODEL_SIZES = {
     "seedream-v4.5": [
@@ -35,13 +34,6 @@ const MODEL_SIZES = {
 const DEFAULT_SIZES = [
     { value: "1024x1024", label: "1024×1024" },
     { value: "custom",    label: "Custom…" },
-];
-
-// Keywords used to filter the NanoGPT model list down to image models only
-const IMAGE_MODEL_KEYWORDS = [
-    "dream", "flux", "dall", "imagen", "stable-diffusion",
-    "sdxl", "sd3", "hidream", "nano-banana", "seedream",
-    "recraft", "ideogram", "kolors",
 ];
 
 // ── IndexedDB (reference image gallery only) ──────────────────────────────────
@@ -109,77 +101,6 @@ function getCurrentCharacterName() {
     return context?.name2 || null;
 }
 
-// ── Model fetching ────────────────────────────────────────────────────────────
-
-async function fetchImageModels() {
-    const settings = getSettings();
-    if (!settings.api_key) {
-        renderModelDropdownFallback();
-        return;
-    }
-
-    $("#img2img_model_loading").show();
-    $("#img2img_model_select").hide();
-    $("#img2img_model_error").hide();
-
-    try {
-        const response = await fetch(NANO_MODELS_URL, {
-            headers: { "Authorization": `Bearer ${settings.api_key}` },
-        });
-
-        if (!response.ok) throw new Error(`HTTP ${response.status}`);
-
-        const data = await response.json();
-        const allModels = data.data || [];
-
-        // Filter to image-generation models by keyword matching on model id
-        const imageModels = allModels.filter(m =>
-            IMAGE_MODEL_KEYWORDS.some(kw => m.id.toLowerCase().includes(kw))
-        );
-
-        if (imageModels.length === 0) {
-            throw new Error("No image models found in response");
-        }
-
-        populateModelDropdown(imageModels);
-        console.log(`[Img2Img] Loaded ${imageModels.length} image models from NanoGPT.`);
-    } catch (err) {
-        console.warn("[Img2Img] Could not fetch model list:", err);
-        renderModelDropdownFallback();
-        $("#img2img_model_error").text(`⚠ Could not load models: ${err.message}`).show();
-    } finally {
-        $("#img2img_model_loading").hide();
-    }
-}
-
-function populateModelDropdown(models) {
-    const $select = $("#img2img_model_select");
-    const current = getSettings().model;
-
-    $select.empty();
-    models.forEach(m => {
-        const label = m.name ? `${m.name} (${m.id})` : m.id;
-        const selected = m.id === current ? "selected" : "";
-        $select.append(`<option value="${m.id}" ${selected}>${label}</option>`);
-    });
-
-    // If saved model isn't in the list, add it as an option so it isn't lost
-    if (!models.find(m => m.id === current)) {
-        $select.prepend(`<option value="${current}" selected>${current} (saved)</option>`);
-    }
-
-    $select.show();
-    updateSizeDropdown(current);
-}
-
-function renderModelDropdownFallback() {
-    // No API key or fetch failed — show a plain text input instead
-    const current = getSettings().model;
-    $("#img2img_model_select").hide();
-    $("#img2img_model_manual").val(current).show();
-    updateSizeDropdown(current);
-}
-
 // ── Size dropdown ─────────────────────────────────────────────────────────────
 
 function updateSizeDropdown(modelId) {
@@ -193,25 +114,20 @@ function updateSizeDropdown(modelId) {
         $sizeSelect.append(`<option value="${s.value}" ${selected}>${s.label}</option>`);
     });
 
-    // If the saved size isn't valid for this model, reset to first option
+    // If saved size isn't valid for this model, reset to first non-custom option
     const validMatch = sizes.find(s => s.value === currentSize);
     if (!validMatch) {
-        const firstSize = sizes[0].value === "custom" ? sizes[1]?.value || sizes[0].value : sizes[0].value;
-        getSettings().image_size = firstSize;
+        const firstReal = sizes.find(s => s.value !== "custom") || sizes[0];
+        getSettings().image_size = firstReal.value;
         saveSettingsDebounced();
-        $sizeSelect.val(firstSize);
+        $sizeSelect.val(firstReal.value);
     }
 
-    // Show/hide custom size inputs
     toggleCustomSizeInputs($sizeSelect.val() === "custom");
 }
 
 function toggleCustomSizeInputs(show) {
-    if (show) {
-        $("#img2img_custom_size").show();
-    } else {
-        $("#img2img_custom_size").hide();
-    }
+    $("#img2img_custom_size").toggle(show);
 }
 
 function validateAndSaveCustomSize() {
@@ -220,17 +136,13 @@ function validateAndSaveCustomSize() {
 
     if (!w || !h) return;
 
-    const pixels = w * h;
-    const ratio = Math.max(w, h) / Math.min(w, h);
-
-    if (pixels < 3_600_000 || pixels > 16_700_000) {
-        const mp = (pixels / 1_000_000).toFixed(2);
-        toastr.warning(`Total pixels (${mp}MP) must be between 3.6MP and 16.7MP.`);
+    // Seedream on NanoGPT: each dimension must be 1024–4096px
+    if (w < 1024 || w > 4096) {
+        toastr.warning(`Width must be between 1024 and 4096 pixels (got ${w}).`);
         return;
     }
-
-    if (ratio > 2.5) {
-        toastr.warning(`Aspect ratio ${ratio.toFixed(2)}:1 exceeds the 2.5:1 maximum.`);
+    if (h < 1024 || h > 4096) {
+        toastr.warning(`Height must be between 1024 and 4096 pixels (got ${h}).`);
         return;
     }
 
@@ -470,38 +382,40 @@ function renderSettingsPanel() {
             <h4>🖼️ Img2Img Reference Generator</h4>
 
             <label>NanoGPT API Key</label>
-            <div style="display:flex; gap:6px; align-items:center;">
-                <input type="password"
-                       id="img2img_api_key"
-                       class="text_pole"
-                       placeholder="Paste your NanoGPT API key here"
-                       value="${settings.api_key}"
-                       style="flex:1;" />
-                <button id="img2img_load_models" class="menu_button" title="Fetch model list from NanoGPT">🔄 Load Models</button>
-            </div>
+            <input type="password"
+                   id="img2img_api_key"
+                   class="text_pole"
+                   placeholder="Paste your NanoGPT API key here"
+                   value="${settings.api_key}" />
             <small>Your key is stored locally and never shared.</small>
 
-            <label style="margin-top:10px;">Model</label>
-            <span id="img2img_model_loading" style="display:none; font-size:0.85em; color:#aaa;">⏳ Loading models…</span>
-            <span id="img2img_model_error"   style="display:none; font-size:0.85em; color:#e88;"></span>
-            <select id="img2img_model_select" class="text_pole" style="display:none;"></select>
-            <input  type="text"
-                    id="img2img_model_manual"
-                    class="text_pole"
-                    placeholder="e.g. seedream-v4.5"
-                    value="${settings.model}"
-                    style="display:none;" />
-            <small>Click 🔄 Load Models after entering your API key to populate this list.</small>
+            <label style="margin-top:10px;">Model ID</label>
+            <input type="text"
+                   id="img2img_model"
+                   class="text_pole"
+                   placeholder="e.g. seedream-v4.5"
+                   value="${settings.model}" />
+            <small>Enter your model's exact API ID. Find it at <a href="https://nano-gpt.com/models" target="_blank">nano-gpt.com/models</a>.</small>
 
             <label style="margin-top:10px;">Image Size</label>
             <select id="img2img_size" class="text_pole"></select>
             <div id="img2img_custom_size" style="display:none; margin-top:6px;">
-                <div style="display:flex; gap:6px;">
-                    <input type="number" id="img2img_custom_w" class="text_pole" placeholder="Width px" style="flex:1;" />
-                    <span style="line-height:2em;">×</span>
-                    <input type="number" id="img2img_custom_h" class="text_pole" placeholder="Height px" style="flex:1;" />
+                <div style="display:flex; gap:8px; align-items:flex-end;">
+                    <div style="flex:1;">
+                        <label style="font-size:0.85em; display:block; margin-bottom:2px;">Width (px)</label>
+                        <input type="number" id="img2img_custom_w" class="text_pole"
+                               placeholder="e.g. 2048" min="1024" max="4096" />
+                        <small>1024–4096</small>
+                    </div>
+                    <span style="font-size:1.3em; padding-bottom:18px;">×</span>
+                    <div style="flex:1;">
+                        <label style="font-size:0.85em; display:block; margin-bottom:2px;">Height (px)</label>
+                        <input type="number" id="img2img_custom_h" class="text_pole"
+                               placeholder="e.g. 3072" min="1024" max="4096" />
+                        <small>1024–4096</small>
+                    </div>
                 </div>
-                <small>Total pixels: 3.6MP–16.7MP. Max ratio: 2.5:1. Changes save on blur.</small>
+                <small style="margin-top:4px; display:block; color:#aaa;">Tab or click away to apply.</small>
             </div>
 
             <hr />
@@ -534,25 +448,9 @@ function renderSettingsPanel() {
         saveSettingsDebounced();
     });
 
-    // ── Load models button ──
-    $("#img2img_load_models").on("click", () => {
-        // Capture any freshly typed key before fetching
-        getSettings().api_key = $("#img2img_api_key").val();
-        saveSettingsDebounced();
-        fetchImageModels();
-    });
-
-    // ── Model select (populated by fetchImageModels) ──
-    $("#img2img_model_select").on("change", function () {
-        const modelId = $(this).val();
-        getSettings().model = modelId;
-        saveSettingsDebounced();
-        updateSizeDropdown(modelId);
-    });
-
-    // ── Model manual fallback input ──
-    $("#img2img_model_manual").on("input", function () {
-        const modelId = $(this).val();
+    // ── Model ID ──
+    $("#img2img_model").on("input", function () {
+        const modelId = $(this).val().trim();
         getSettings().model = modelId;
         saveSettingsDebounced();
         updateSizeDropdown(modelId);
@@ -568,7 +466,7 @@ function renderSettingsPanel() {
         }
     });
 
-    // ── Custom size inputs ──
+    // ── Custom size inputs — save on blur ──
     $("#img2img_custom_w, #img2img_custom_h").on("change", validateAndSaveCustomSize);
 
     // ── File upload ──
@@ -578,13 +476,7 @@ function renderSettingsPanel() {
         handleImageUpload(files);
     });
 
-    // Populate size dropdown for the currently saved model immediately
-    // (model dropdown gets populated on Load Models click)
     updateSizeDropdown(settings.model);
-
-    // Show the manual input by default until Load Models is clicked
-    renderModelDropdownFallback();
-
     renderGallery();
 }
 
@@ -613,5 +505,5 @@ jQuery(async () => {
         true
     );
 
-    console.log("[Img2Img] Extension ready (v0.9.0). Use /img2img [prompt] to generate.");
+    console.log("[Img2Img] Extension ready (v0.9.1). Use /img2img [prompt] to generate.");
 });

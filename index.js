@@ -227,18 +227,31 @@ function buildChatContext(numMessages) {
     const context = getContext();
     const chat = context?.chat || [];
 
-    // Grab the last N real messages, skipping our own injected images
-    const recent = chat
-        .filter(m => !m.extra?.img2img)
-        .slice(-numMessages);
+    // Filter out:
+    //   - our own injected image messages
+    //   - slash command invocations (user messages starting with /)
+    //   - empty messages
+    const usable = chat.filter(m => {
+        if (m.extra?.img2img) return false;
+        const text = (m.mes || "").trim();
+        if (!text) return false;
+        if (m.is_user && text.startsWith("/")) return false;
+        return true;
+    });
+
+    const recent = usable.slice(-numMessages);
 
     if (recent.length === 0) return "(No recent messages available.)";
 
-    return recent.map(m => {
+    const lines = recent.map(m => {
         const speaker = m.is_user ? "User" : (m.name || "Character");
         const text = (m.mes || "").trim();
-        return text ? `${speaker}: ${text}` : null;
-    }).filter(Boolean).join("\n");
+        return `${speaker}: ${text}`;
+    });
+
+    console.log(`[Img2Img] Auto-prompt context (${recent.length} messages):\n` + lines.join("\n---\n"));
+
+    return lines.join("\n");
 }
 
 async function generateAutoPrompt() {
@@ -955,5 +968,5 @@ jQuery(async () => {
         true
     );
 
-    console.log("[Img2Img] Extension ready (v0.12.0). /img2img [prompt] or /img2img for auto-prompt.");
+    console.log("[Img2Img] Extension ready (v0.12.1). /img2img [prompt] or /img2img for auto-prompt.");
 });

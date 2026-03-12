@@ -85,36 +85,23 @@ function getCurrentCharacterName() {
 
 // ── Image persistence ─────────────────────────────────────────────────────────
 
-async function fetchImageAsBase64(url) {
-    console.log("[Img2Img] Fetching image for local persistence...");
-    const response = await fetch(url);
-    if (!response.ok) throw new Error(`Failed to fetch image: ${response.status}`);
-    const blob = await response.blob();
-    return new Promise((resolve, reject) => {
-        const reader = new FileReader();
-        reader.onload = (e) => resolve(e.target.result);
-        reader.onerror = (e) => reject(e);
-        reader.readAsDataURL(blob);
-    });
-}
+// ── Image persistence ─────────────────────────────────────────────────────────
 
-async function saveToImageHistory(base64, prompt, characterName) {
-    return new Promise((resolve, reject) => {
-        const tx = db.transaction("image_history", "readwrite");
-        const store = tx.objectStore("image_history");
-        const record = {
-            base64,
-            prompt,
-            characterName: characterName || "Unknown",
-            timestamp: Date.now(),
-        };
-        const request = store.add(record);
-        request.onsuccess = (e) => {
-            console.log("[Img2Img] Image saved to local history. ID:", e.target.result);
-            resolve(e.target.result);
-        };
-        request.onerror = (e) => reject(e.target.error);
+async function saveImageLocally(remoteUrl, characterName, prompt) {
+    const response = await fetch("/api/plugins/img2img/save-image", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ imageUrl: remoteUrl, characterName, prompt }),
     });
+
+    if (!response.ok) {
+        const err = await response.text();
+        throw new Error(`Local save failed: ${err}`);
+    }
+
+    const data = await response.json();
+    console.log("[Img2Img] Image saved locally at:", data.localPath);
+    return data.localPath; // e.g. /user/images/img2img_Kira_1234567890.jpg
 }
 
 // ── API call ──────────────────────────────────────────────────────────────────
@@ -174,10 +161,9 @@ async function generateImage(prompt) {
 
 // ── Chat injection ────────────────────────────────────────────────────────────
 
-function injectImageIntoChat(imageUrl, prompt) {
-    const messageHtml = `<img src="${imageUrl}" alt="${prompt}" style="max-width:100%; border-radius:8px; cursor:pointer;" onclick="window.open('${imageUrl}', '_blank')" title="Click to open full size" /><div class="img2img_prompt_label">🖼️ ${prompt}</div>`;
+function injectImageIntoChat(localPath, prompt) {
+    const messageHtml = `<img src="${localPath}" alt="${prompt}" style="max-width:100%; border-radius:8px; cursor:pointer;" onclick="window.open('${localPath}', '_blank')" title="Click to open full size" /><div class="img2img_prompt_label">🖼️ ${prompt}</div>`;
 
-    // Append directly into the chat as a system message div
     const $msg = $(`
         <div class="mes system_mes img2img_result_msg">
             <div class="mes_block">
@@ -218,19 +204,19 @@ async function handleGenerateCommand(namedArgs, unnamedValue) {
     showLoadingMessage();
 
     try {
+        const charName = getCurrentCharacterName();
+
         // Step 1 — generate via API
         const remoteUrl = await generateImage(prompt.trim());
 
-        // Step 2 — immediately fetch and persist locally
-        const base64 = await fetchImageAsBase64(remoteUrl);
-        const charName = getCurrentCharacterName();
-        await saveToImageHistory(base64, prompt.trim(), charName);
+        // Step 2 — save to VPS filesystem
+        const localPath = await saveImageLocally(remoteUrl, charName, prompt.trim());
 
-        // Step 3 — inject into chat using local data, not the expiring URL
+        // Step 3 — inject into chat using local path
         hideLoadingMessage();
-        injectImageIntoChat(base64, prompt.trim());
+        injectImageIntoChat(localPath, prompt.trim());
 
-        toastr.success(`Image generated and saved locally.`);
+        toastr.success("Image generated and saved locally.");
     } catch (err) {
         hideLoadingMessage();
         console.error("[Img2Img] Generation failed:", err);

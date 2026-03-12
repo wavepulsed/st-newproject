@@ -109,16 +109,14 @@ async function fetchAndSaveImage(remoteUrl, characterName) {
 
 async function injectImageIntoChat(localPath, prompt) {
     const context = getContext();
-    const encodedPath = encodeURI(localPath);
-    const messageContent = `![${prompt}](${encodedPath})`;
 
     const message = {
         name: context.name2 || "Img2Img",
         is_user: false,
         is_system: true,
         send_date: new Date().toISOString(),
-        mes: messageContent,
-        swipes: [messageContent],
+        mes: "",                    // empty — image comes from extra.image, not markdown
+        swipes: [""],
         swipe_id: 0,
         swipe_info: [{
             send_date: new Date().toISOString(),
@@ -129,10 +127,11 @@ async function injectImageIntoChat(localPath, prompt) {
         extra: {
             isSmallSys: false,
             img2img: true,
+            image: localPath,       // ST's image renderer picks this up
+            title: prompt,          // shown as caption/alt
         },
     };
 
-    // No insertAt — let addOneMessage handle positioning itself
     await addOneMessage(message, { type: "normal" });
 
     await saveChatDebounced();

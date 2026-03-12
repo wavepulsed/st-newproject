@@ -1,8 +1,8 @@
 // Img2Img Reference Generator for SillyTavern
-// Version 0.7.0 — Native ST filesystem integration via saveBase64AsFile
+// Version 0.8.0 — Real ST chat messages, native lightbox + gallery
 
 import { extension_settings, getContext } from "../../../extensions.js";
-import { saveSettingsDebounced, eventSource, event_types } from "../../../../script.js";
+import { saveSettingsDebounced, eventSource, event_types, saveChatDebounced } from "../../../../script.js";
 import { registerSlashCommand } from "../../../slash-commands.js";
 import { saveBase64AsFile } from "../../../../scripts/utils.js";
 
@@ -89,13 +89,10 @@ async function fetchAndSaveImage(remoteUrl, characterName) {
     const mimeType = blob.type || "image/jpeg";
     const ext = mimeType.split("/")[1] || "jpg";
 
-    // Convert blob to raw base64 (no data: prefix — that's what saveBase64AsFile expects)
     const base64 = await new Promise((resolve, reject) => {
         const reader = new FileReader();
         reader.onload = (e) => {
-            // Strip the "data:image/jpeg;base64," prefix
-            const result = e.target.result;
-            resolve(result.split(",")[1]);
+            resolve(e.target.result.split(",")[1]);
         };
         reader.onerror = reject;
         reader.readAsDataURL(blob);
@@ -103,8 +100,6 @@ async function fetchAndSaveImage(remoteUrl, characterName) {
 
     const fileName = `img2img_${Date.now()}`;
 
-    // saveBase64AsFile(base64, characterName, fileName, extension)
-    // Returns a local URL like /user/images/CharacterName/img2img_123456.jpg
     const localUrl = await saveBase64AsFile(base64, characterName || "img2img", fileName, ext);
     console.log("[Img2Img] Image saved to ST filesystem:", localUrl);
 
@@ -113,79 +108,32 @@ async function fetchAndSaveImage(remoteUrl, characterName) {
 
 // ── Chat injection ────────────────────────────────────────────────────────────
 
-function injectImageIntoChat(localUrl, prompt) {
-    const $msg = $(`
-        <div class="mes system_mes img2img_result_msg" data-localurl="${localUrl}">
-            <div class="mes_block">
-                <div class="mes_text">
-                    <img src="${localUrl}"
-                         alt="${prompt}"
-                         class="img2img_generated"
-                         style="max-width:100%; border-radius:8px; cursor:pointer;"
-                         onclick="window.open('${localUrl}', '_blank')"
-                         title="Click to open full size" />
-                    <div class="img2img_prompt_label">🖼️ ${prompt}</div>
-                </div>
-            </div>
-        </div>
-    `);
+async function injectImageIntoChat(localPath, prompt) {
+    const context = getContext();
 
-    $("#chat").append($msg);
+    // Build a real ST message using markdown image syntax
+    // ST renders ![alt](src) natively — handles lightbox and gallery automatically
+    const message = {
+        name: context.name2 || "Img2Img",
+        is_user: false,
+        is_system: true,
+        send_date: new Date().toISOString(),
+        mes: `![${prompt}](${localPath})`,
+        extra: {
+            isSmallSys: false,
+            img2img: true,
+        },
+    };
+
+    // Push into the live chat array — context.chat is mutable per the ST docs
+    context.chat.push(message);
+
+    // Save to disk and re-render
+    await saveChatDebounced();
+    eventSource.emit(event_types.MESSAGE_SENT, context.chat.length - 1);
+
     $("#chat").scrollTop($("#chat")[0].scrollHeight);
-
-    // Persist the local URL in chatMetadata for restoration after refresh
-    saveToChatMetadata(localUrl, prompt);
-}
-
-function saveToChatMetadata(localUrl, prompt) {
-    try {
-        const context = getContext();
-        const metadata = context.chatMetadata;
-        if (!metadata) return;
-        if (!metadata.img2img_images) metadata.img2img_images = [];
-        metadata.img2img_images.push({ localUrl, prompt, timestamp: Date.now() });
-        context.saveMetadata();
-        console.log("[Img2Img] Saved URL to chatMetadata:", localUrl);
-    } catch (err) {
-        console.warn("[Img2Img] Could not save to chatMetadata:", err);
-    }
-}
-
-// ── Chat restore on load ──────────────────────────────────────────────────────
-
-function restoreImagesInChat() {
-    try {
-        const context = getContext();
-        const stored = context?.chatMetadata?.img2img_images;
-        if (!stored || stored.length === 0) return;
-
-        console.log(`[Img2Img] Restoring ${stored.length} image(s) from chatMetadata...`);
-        $(".img2img_result_msg").remove();
-
-        for (const entry of stored) {
-            const $msg = $(`
-                <div class="mes system_mes img2img_result_msg" data-localurl="${entry.localUrl}">
-                    <div class="mes_block">
-                        <div class="mes_text">
-                            <img src="${entry.localUrl}"
-                                 alt="${entry.prompt}"
-                                 class="img2img_generated"
-                                 style="max-width:100%; border-radius:8px; cursor:pointer;"
-                                 onclick="window.open('${entry.localUrl}', '_blank')"
-                                 title="Click to open full size" />
-                            <div class="img2img_prompt_label">🖼️ ${entry.prompt}</div>
-                        </div>
-                    </div>
-                </div>
-            `);
-            $("#chat").append($msg);
-        }
-
-        $("#chat").scrollTop($("#chat")[0].scrollHeight);
-        console.log("[Img2Img] Restore complete.");
-    } catch (err) {
-        console.warn("[Img2Img] Restore failed:", err);
-    }
+    console.log("[Img2Img] Message pushed to chat:", localPath);
 }
 
 // ── Loading indicator ─────────────────────────────────────────────────────────
@@ -269,13 +217,13 @@ async function handleGenerateCommand(namedArgs, unnamedValue) {
         const remoteUrl = await generateImage(prompt.trim());
 
         // 2. Fetch and save permanently to ST's own filesystem
-        const localUrl = await fetchAndSaveImage(remoteUrl, charName);
+        const localPath = await fetchAndSaveImage(remoteUrl, charName);
 
-        // 3. Inject into chat using permanent local URL
+        // 3. Inject as a real ST chat message
         hideLoadingMessage();
-        injectImageIntoChat(localUrl, prompt.trim());
+        await injectImageIntoChat(localPath, prompt.trim());
 
-        toastr.success(`Image generated and saved to ST gallery.`);
+        toastr.success("Image generated and saved to ST gallery.");
     } catch (err) {
         hideLoadingMessage();
         console.error("[Img2Img] Generation failed:", err);
@@ -438,7 +386,6 @@ function renderSettingsPanel() {
 function registerEvents() {
     eventSource.on(event_types.CHAT_CHANGED, () => {
         renderGallery();
-        setTimeout(restoreImagesInChat, 500);
     });
 }
 
@@ -458,8 +405,6 @@ jQuery(async () => {
         true,
         true
     );
-
-    setTimeout(restoreImagesInChat, 1000);
 
     console.log("[Img2Img] Extension ready. Use /img2img [prompt] to generate.");
 });

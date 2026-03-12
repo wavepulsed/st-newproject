@@ -109,33 +109,59 @@ async function fetchAndSaveImage(remoteUrl, characterName) {
 
 async function injectImageIntoChat(localPath, prompt) {
     const context = getContext();
+    const encodedPath = encodeURI(localPath);
+    const messageContent = `![${prompt}](${encodedPath})`;
 
     const message = {
         name: context.name2 || "Img2Img",
         is_user: false,
         is_system: true,
         send_date: new Date().toISOString(),
-       mes: `![${prompt}](${encodeURI(localPath)})`,
+        mes: messageContent,
+        // Initialise swipes properly so ST shows 1/1 and regen works
+        swipes: [messageContent],
+        swipe_id: 0,
+        swipe_info: [{
+            send_date: new Date().toISOString(),
+            gen_started: null,
+            gen_finished: null,
+            extra: { img2img: true },
+        }],
         extra: {
             isSmallSys: false,
             img2img: true,
         },
-        swipes: [],
-        swipe_id: 0,
     };
 
-    // Push to chat array
     context.chat.push(message);
     const messageIndex = context.chat.length - 1;
 
-    // addOneMessage renders it in the DOM exactly like a real ST message
     await addOneMessage(message, { type: "narrator", insertAt: messageIndex });
 
-    // Save to disk
-    await saveChatDebounced();
+    // Trigger ST's image lightbox binding on the newly rendered message
+    // ST uses this to attach zoom/lightbox handlers to images in chat
+    const $newMessage = $(`#chat .mes[mesid="${messageIndex}"]`);
+    if ($newMessage.length) {
+        $newMessage.find("img").addClass("img_enlarged_thumb");
+        $newMessage.find("img").on("click", function () {
+            const src = $(this).attr("src");
+            const $overlay = $(`
+                <div id="img2img_lightbox" style="
+                    position:fixed; inset:0; background:rgba(0,0,0,0.85);
+                    display:flex; align-items:center; justify-content:center;
+                    z-index:9999; cursor:zoom-out;">
+                    <img src="${src}" style="max-width:90vw; max-height:90vh;
+                        border-radius:8px; box-shadow:0 8px 32px rgba(0,0,0,0.5);" />
+                </div>
+            `);
+            $overlay.on("click", () => $overlay.remove());
+            $("body").append($overlay);
+        });
+    }
 
+    await saveChatDebounced();
     $("#chat").scrollTop($("#chat")[0].scrollHeight);
-    console.log("[Img2Img] Message rendered and saved:", localPath);
+    console.log("[Img2Img] Message rendered at index:", messageIndex);
 }
 
 // ── Loading indicator ─────────────────────────────────────────────────────────

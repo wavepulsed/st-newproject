@@ -2,7 +2,7 @@
 // Version 0.8.0 — Real ST chat messages, native lightbox + gallery
 
 import { extension_settings, getContext } from "../../../extensions.js";
-import { saveSettingsDebounced, eventSource, event_types, saveChatDebounced } from "../../../../script.js";
+import { saveSettingsDebounced, eventSource, event_types, saveChatDebounced, addOneMessage } from "../../../../script.js";
 import { registerSlashCommand } from "../../../slash-commands.js";
 import { saveBase64AsFile } from "../../../../scripts/utils.js";
 
@@ -106,13 +106,9 @@ async function fetchAndSaveImage(remoteUrl, characterName) {
     return localUrl;
 }
 
-// ── Chat injection ────────────────────────────────────────────────────────────
-
 async function injectImageIntoChat(localPath, prompt) {
     const context = getContext();
 
-    // Build a real ST message using markdown image syntax
-    // ST renders ![alt](src) natively — handles lightbox and gallery automatically
     const message = {
         name: context.name2 || "Img2Img",
         is_user: false,
@@ -123,17 +119,22 @@ async function injectImageIntoChat(localPath, prompt) {
             isSmallSys: false,
             img2img: true,
         },
+        swipes: [],
+        swipe_id: 0,
     };
 
-    // Push into the live chat array — context.chat is mutable per the ST docs
+    // Push to chat array
     context.chat.push(message);
+    const messageIndex = context.chat.length - 1;
 
-    // Save to disk and re-render
+    // addOneMessage renders it in the DOM exactly like a real ST message
+    await addOneMessage(message, { type: "narrator", insertAt: messageIndex });
+
+    // Save to disk
     await saveChatDebounced();
-    eventSource.emit(event_types.MESSAGE_SENT, context.chat.length - 1);
 
     $("#chat").scrollTop($("#chat")[0].scrollHeight);
-    console.log("[Img2Img] Message pushed to chat:", localPath);
+    console.log("[Img2Img] Message rendered and saved:", localPath);
 }
 
 // ── Loading indicator ─────────────────────────────────────────────────────────

@@ -129,18 +129,14 @@ async function injectImageIntoChat(localPath, prompt) {
         extra: {
             isSmallSys: false,
             img2img: true,
-            image: localPath,       // ST checks this on reload to restore the image
-            title: prompt,          // ST uses this as the image caption/alt text
         },
     };
 
-    // Do NOT push to context.chat manually — addOneMessage handles that internally
     const messageIndex = context.chat.length;
     await addOneMessage(message, { type: "normal", insertAt: messageIndex });
 
     await saveChatDebounced();
     $("#chat").scrollTop($("#chat")[0].scrollHeight);
-    console.log("[Img2Img] Message rendered at index:", messageIndex);
 }
 
 // ── Loading indicator ─────────────────────────────────────────────────────────

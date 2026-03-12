@@ -8,7 +8,7 @@ import { registerSlashCommand } from "../../../slash-commands.js";
 const extensionName = "st-img2img";
 const NANO_API_URL = "https://nano-gpt.com/api/v1/images/generations";
 const DB_NAME = "img2img_gallery_db";
-const DB_VERSION = 1;
+const DB_VERSION = 2;
 const STORE_NAME = "galleries";
 
 // ── IndexedDB ─────────────────────────────────────────────────────────────────
@@ -22,6 +22,13 @@ function openDatabase() {
             const database = e.target.result;
             if (!database.objectStoreNames.contains(STORE_NAME)) {
                 database.createObjectStore(STORE_NAME, { keyPath: "characterName" });
+            }
+            if (!database.objectStoreNames.contains("image_history")) {
+                const historyStore = database.createObjectStore("image_history", {
+                    keyPath: "id",
+                    autoIncrement: true,
+                });
+                historyStore.createIndex("characterName", "characterName", { unique: false });
             }
         };
         request.onsuccess = (e) => { db = e.target.result; resolve(db); };
@@ -74,6 +81,40 @@ function getSettings() {
 function getCurrentCharacterName() {
     const context = getContext();
     return context?.name2 || null;
+}
+
+// ── Image persistence ─────────────────────────────────────────────────────────
+
+async function fetchImageAsBase64(url) {
+    console.log("[Img2Img] Fetching image for local persistence...");
+    const response = await fetch(url);
+    if (!response.ok) throw new Error(`Failed to fetch image: ${response.status}`);
+    const blob = await response.blob();
+    return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = (e) => resolve(e.target.result);
+        reader.onerror = (e) => reject(e);
+        reader.readAsDataURL(blob);
+    });
+}
+
+async function saveToImageHistory(base64, prompt, characterName) {
+    return new Promise((resolve, reject) => {
+        const tx = db.transaction("image_history", "readwrite");
+        const store = tx.objectStore("image_history");
+        const record = {
+            base64,
+            prompt,
+            characterName: characterName || "Unknown",
+            timestamp: Date.now(),
+        };
+        const request = store.add(record);
+        request.onsuccess = (e) => {
+            console.log("[Img2Img] Image saved to local history. ID:", e.target.result);
+            resolve(e.target.result);
+        };
+        request.onerror = (e) => reject(e.target.error);
+    });
 }
 
 // ── API call ──────────────────────────────────────────────────────────────────
@@ -177,9 +218,19 @@ async function handleGenerateCommand(namedArgs, unnamedValue) {
     showLoadingMessage();
 
     try {
-        const imageUrl = await generateImage(prompt.trim());
+        // Step 1 — generate via API
+        const remoteUrl = await generateImage(prompt.trim());
+
+        // Step 2 — immediately fetch and persist locally
+        const base64 = await fetchImageAsBase64(remoteUrl);
+        const charName = getCurrentCharacterName();
+        await saveToImageHistory(base64, prompt.trim(), charName);
+
+        // Step 3 — inject into chat using local data, not the expiring URL
         hideLoadingMessage();
-        injectImageIntoChat(imageUrl, prompt.trim());
+        injectImageIntoChat(base64, prompt.trim());
+
+        toastr.success(`Image generated and saved locally.`);
     } catch (err) {
         hideLoadingMessage();
         console.error("[Img2Img] Generation failed:", err);

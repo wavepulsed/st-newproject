@@ -518,7 +518,7 @@ function injectWidgetStyles() {
             border-radius: 50%;
         }
         #img2img_widget_panel {
-            position: absolute; bottom: 68px; right: 0;
+            position: fixed;
             width: 310px;
             background: var(--SmartThemeBlurTintColor, #1c1b2e);
             border: 1px solid rgba(155,114,232,0.22);
@@ -690,6 +690,7 @@ function createFloatingWidget() {
             </div>
             <div id="img2img_widget_footer">
                 <button id="img2img_widget_change_icon" title="Upload a custom widget icon">Change icon</button>
+                <button id="img2img_widget_revert_icon" title="Revert to default icon" style="display:${settings.widget_icon ? 'inline' : 'none'};">Revert</button>
                 <input type="file" id="img2img_widget_icon_upload" accept="image/*" style="display:none;" />
             </div>
         </div>
@@ -765,9 +766,19 @@ function createFloatingWidget() {
             getSettings().widget_icon = dataUrl;
             saveSettingsDebounced();
             $("#img2img_widget_icon_img").attr("src", dataUrl);
+            $("#img2img_widget_revert_icon").show();
             toastr.success("Widget icon updated.");
         };
         reader.readAsDataURL(file);
+    });
+
+    $("#img2img_widget_revert_icon").on("click", () => {
+        getSettings().widget_icon = null;
+        saveSettingsDebounced();
+        const defaultSrc = `data:image/svg+xml;charset=utf-8,${encodeURIComponent(DEFAULT_WIDGET_ICON_SVG)}`;
+        $("#img2img_widget_icon_img").attr("src", defaultSrc);
+        $("#img2img_widget_revert_icon").hide();
+        toastr.success("Widget icon reverted to default.");
     });
 
     // ── Drag ──
@@ -825,7 +836,31 @@ function toggleWidget() {
 }
 
 function openWidget() {
-    $("#img2img_widget_panel").show();
+    const $panel = $("#img2img_widget_panel");
+    const $fab   = $("#img2img_widget_fab");
+    const fab    = $fab[0].getBoundingClientRect();
+    const vw     = window.innerWidth;
+    const vh     = window.innerHeight;
+    const panelW = 310;
+    const panelH = 320; // approximate — enough to decide direction
+
+    // Vertical: prefer opening upward, flip down if not enough room
+    const spaceAbove = fab.top;
+    const spaceBelow = vh - fab.bottom;
+    const openUp = spaceAbove >= panelH || spaceAbove >= spaceBelow;
+
+    // Horizontal: align to right edge of FAB, flip left if it would overflow
+    let left = fab.right - panelW;
+    if (left < 4) left = Math.min(4, fab.left);
+    if (left + panelW > vw - 4) left = vw - panelW - 4;
+
+    $panel.css({
+        left:   left + "px",
+        right:  "auto",
+        top:    openUp  ? "auto"              : (fab.bottom + 6) + "px",
+        bottom: openUp  ? (vh - fab.top + 6) + "px" : "auto",
+    }).show();
+
     refreshWidgetState();
 }
 
@@ -863,7 +898,9 @@ function initTextareaResize($container, $grip, $textarea) {
         if (!resizing) return;
         const delta  = e.clientY - startY;
         const newH   = Math.max(60, startH + delta);
-        const newBottom = Math.max(0, startBottom - delta);
+        const fabH   = $container.outerHeight() || 56;
+        const maxBottom = window.innerHeight - fabH;
+        const newBottom = Math.min(maxBottom, Math.max(0, startBottom - delta));
         $textarea.css("min-height", newH + "px").css("height", newH + "px");
         $container.css("bottom", newBottom + "px");
     });
@@ -911,8 +948,12 @@ function initWidgetDrag($container, $handle, $fab) {
         const dx = e.clientX - startX;
         const dy = e.clientY - startY;
         if (Math.abs(dx) > 3 || Math.abs(dy) > 3) didDrag = true;
-        const newRight  = Math.max(0, startRight  - dx);
-        const newBottom = Math.max(0, startBottom - dy);
+        const fabW = $container.outerWidth()  || 56;
+        const fabH = $container.outerHeight() || 56;
+        const maxRight  = window.innerWidth  - fabW;
+        const maxBottom = window.innerHeight - fabH;
+        const newRight  = Math.min(maxRight,  Math.max(0, startRight  - dx));
+        const newBottom = Math.min(maxBottom, Math.max(0, startBottom - dy));
         $container.css({ right: newRight + "px", bottom: newBottom + "px" });
     });
 

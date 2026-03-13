@@ -1,5 +1,5 @@
 // Img2Img Reference Generator for SillyTavern
-// Version 0.14.0 — Inline input, regen support
+// Version 0.15.0 — Native swipe regen, styled confirm dialogs
 
 import { extension_settings, getContext } from "../../../extensions.js";
 import { saveSettingsDebounced, eventSource, event_types, saveChatDebounced, addOneMessage } from "../../../../script.js";
@@ -368,10 +368,6 @@ async function injectImageIntoChat(localPath, prompt) {
     await addOneMessage(message, { type: "normal", insertAt: messageIndex });
     await saveChatDebounced();
     $("#chat").scrollTop($("#chat")[0].scrollHeight);
-
-    // Attach regen button to the newly rendered message
-    const $newBlock = $(`.mes[mesid="${messageIndex}"]`);
-    attachRegenButton($newBlock, prompt);
 }
 
 // ── Loading indicator ─────────────────────────────────────────────────────────
@@ -486,67 +482,67 @@ async function handleGenerateCommand(namedArgs, unnamedValue) {
     }
 }
 
-// ── Regen support ─────────────────────────────────────────────────────────────
+// ── Swipe / regen support ─────────────────────────────────────────────────────
 
-function injectRegenStyles() {
-    if ($("#img2img_regen_styles").length) return;
-    $("head").append(`<style id="img2img_regen_styles">
-        .img2img_regen_btn {
-            position: absolute; bottom: 6px; right: 6px;
-            padding: 3px 9px; font-size: 0.73em;
-            background: rgba(155,114,232,0.18);
-            border: 1px solid rgba(155,114,232,0.35);
-            border-radius: 6px; cursor: pointer; color: inherit;
-            opacity: 0; transition: opacity 0.15s, background 0.1s;
-            z-index: 10;
-        }
-        .img2img_regen_btn:hover { background: rgba(155,114,232,0.38); }
-        .mes_img_container:hover .img2img_regen_btn,
-        .img2img_regen_btn:focus { opacity: 1; }
-        .img2img_regen_btn.spinning { opacity: 0.5; pointer-events: none; }
-    </style>`);
-}
+async function swipeRegenMessage(messageIndex) {
+    const context = getContext();
+    const message = context.chat[messageIndex];
+    if (!message?.extra?.img2img) return;
 
-async function regenFromPrompt(finalPrompt) {
+    const finalPrompt = message.extra.title;
+    if (!finalPrompt) { toastr.warning("No prompt stored on this message — can't regenerate."); return; }
+
     showLoadingMessage();
     try {
         const charName  = getCurrentCharacterName();
         const remoteUrl = await generateImage(finalPrompt);
         const localPath = await fetchAndSaveImage(remoteUrl, charName);
         hideLoadingMessage();
-        await injectImageIntoChat(localPath, finalPrompt);
+
+        // Add new image as a fresh swipe entry
+        const newSwipeInfo = {
+            send_date:    new Date().toISOString(),
+            gen_started:  null,
+            gen_finished: null,
+            extra: { img2img: true },
+        };
+        message.swipes.push("");
+        message.swipe_info.push(newSwipeInfo);
+        message.swipe_id   = message.swipes.length - 1;
+        message.extra.image = localPath;
+
+        // Re-render the message in place
+        const $old = $(`.mes[mesid="${messageIndex}"]`);
+        $old.remove();
+        await addOneMessage(message, { type: "normal", insertAt: messageIndex });
+
+        await saveChatDebounced();
         toastr.success("Image regenerated.");
     } catch (err) {
         hideLoadingMessage();
-        console.error("[Img2Img] Regen failed:", err);
+        console.error("[Img2Img] Swipe regen failed:", err);
         toastr.error(`Regen failed: ${err.message}`);
     }
 }
 
-function attachRegenButton($mesBlock, finalPrompt) {
-    if (!finalPrompt) return;
-    if ($mesBlock.find(".img2img_regen_btn").length) return; // already attached
+function registerSwipeHandler() {
+    // Delegated — catches swipe_right clicks on img2img messages
+    $(document).off("click.img2img_swipe").on("click.img2img_swipe", ".swipe_right", async function () {
+        const $mes = $(this).closest(".mes");
+        const mesId = parseInt($mes.attr("mesid"));
+        if (isNaN(mesId)) return;
 
-    const $imgContainer = $mesBlock.find(".mes_img_container");
-    if (!$imgContainer.length) return;
+        const context = getContext();
+        const message = context?.chat?.[mesId];
+        if (!message?.extra?.img2img) return;
 
-    const $btn = $(`<button class="img2img_regen_btn" title="Regenerate this image">↺ Regen</button>`);
-    $btn.on("click", async () => {
-        $btn.addClass("spinning").text("…");
-        await regenFromPrompt(finalPrompt);
-        $btn.removeClass("spinning").text("↺ Regen");
-    });
-    $imgContainer.css("position", "relative").append($btn);
-}
+        // Only intercept when on the last swipe (i.e. this would generate a new one)
+        const isLastSwipe = message.swipe_id >= message.swipes.length - 1;
+        if (!isLastSwipe) return;
 
-function attachAllRegenButtons() {
-    const context = getContext();
-    if (!context?.chat) return;
-
-    context.chat.forEach((msg, idx) => {
-        if (!msg.extra?.img2img || !msg.extra?.title) return;
-        const $mesBlock = $(`.mes[mesid="${idx}"]`);
-        if ($mesBlock.length) attachRegenButton($mesBlock, msg.extra.title);
+        // Let ST's own handler update swipe_id first, then we override
+        // Use a short delay so we run after ST's click handler
+        setTimeout(() => swipeRegenMessage(mesId), 50);
     });
 }
 
@@ -560,7 +556,6 @@ function getWidgetIconSrc() {
 
 function injectWidgetStyles() {
     if ($("#img2img_widget_styles").length) return;
-    injectRegenStyles();
     $("head").append(`<style id="img2img_widget_styles">
         #img2img_widget_container {
             position: fixed;
@@ -1301,14 +1296,21 @@ function openSetManager() {
             $row.find(".delete-btn").on("click", async () => {
                 if (setNames.length <= 1) return;
                 const r = await loadRecordFromDB(charName);
-                if (!confirm(`Delete set "${name}" and all ${r.sets[name].length} image(s)?`)) return;
-                delete r.sets[name];
-                if (r.activeSet === name) r.activeSet = Object.keys(r.sets)[0];
-                await saveRecordToDB(r);
-                toastr.success(`Set "${name}" deleted.`);
-                refreshWidgetState();
-                renderGallery();
-                renderSetMgr();
+                const imgCount = r.sets[name].length;
+                showConfirm({
+                    title: `Delete "${name}"?`,
+                    message: imgCount > 0 ? `This will remove ${imgCount} image${imgCount !== 1 ? "s" : ""} permanently.` : "",
+                    onConfirm: async () => {
+                        const rec = await loadRecordFromDB(charName);
+                        delete rec.sets[name];
+                        if (rec.activeSet === name) rec.activeSet = Object.keys(rec.sets)[0];
+                        await saveRecordToDB(rec);
+                        toastr.success(`Set "${name}" deleted.`);
+                        refreshWidgetState();
+                        renderGallery();
+                        renderSetMgr();
+                    },
+                });
             });
 
             $list.append($row);
@@ -1582,14 +1584,21 @@ async function renderGallery() {
     $deleteBtn.on("click", async () => {
         const rec = await loadRecordFromDB(charName);
         if (Object.keys(rec.sets).length <= 1) return;
-        const toDelete = rec.activeSet;
-        if (!confirm(`Delete set "${toDelete}" and all its images?`)) return;
-        delete rec.sets[toDelete];
-        rec.activeSet = Object.keys(rec.sets)[0];
-        await saveRecordToDB(rec);
-        toastr.success(`Set "${toDelete}" deleted.`);
-        renderGallery();
-        refreshWidgetState();
+        const toDelete  = rec.activeSet;
+        const imgCount  = rec.sets[toDelete].length;
+        showConfirm({
+            title: `Delete "${toDelete}"?`,
+            message: imgCount > 0 ? `This will remove ${imgCount} image${imgCount !== 1 ? "s" : ""} permanently.` : "",
+            onConfirm: async () => {
+                const r = await loadRecordFromDB(charName);
+                delete r.sets[toDelete];
+                r.activeSet = Object.keys(r.sets)[0];
+                await saveRecordToDB(r);
+                toastr.success(`Set "${toDelete}" deleted.`);
+                renderGallery();
+                refreshWidgetState();
+            },
+        });
     });
 }
 
@@ -1683,6 +1692,44 @@ function showInlineInput({ title, defaultValue = "", placeholder = "", onConfirm
     $input.on("keydown", (e) => {
         if (e.key === "Enter")  confirm();
         if (e.key === "Escape") close();
+    });
+}
+
+
+function showConfirm({ title, message, onConfirm }) {
+    if (!$("#img2img_inline_input_styles").length) {
+        // styles already injected by showInlineInput if called first,
+        // but call it to ensure they exist
+        showInlineInput({ title: "", onConfirm: () => {} });
+        $("#img2img_inline_overlay").remove();
+    }
+
+    $("#img2img_inline_overlay").remove();
+
+    const $overlay = $(`
+        <div id="img2img_inline_overlay">
+            <div id="img2img_inline_box">
+                <div id="img2img_inline_title">${title}</div>
+                ${message ? `<div style="font-size:0.8em;color:rgba(255,255,255,0.5);line-height:1.5;">${message}</div>` : ""}
+                <div class="img2img_inline_btns">
+                    <button class="img2img_inline_btn cancel">Cancel</button>
+                    <button class="img2img_inline_btn confirm" style="background:rgba(200,60,60,0.2);border-color:rgba(200,60,60,0.38);">Delete</button>
+                </div>
+            </div>
+        </div>
+    `);
+
+    $("body").append($overlay);
+
+    const close = () => $("#img2img_inline_overlay").remove();
+    const confirm = () => { close(); onConfirm(); };
+
+    $overlay.find(".confirm").on("click", confirm);
+    $overlay.find(".cancel").on("click", close);
+    $overlay.on("click", (e) => { if ($(e.target).is("#img2img_inline_overlay")) close(); });
+    $(document).one("keydown.img2img_confirm", (e) => {
+        if (e.key === "Enter")  confirm();
+        if (e.key === "Escape") { close(); $(document).off("keydown.img2img_confirm"); }
     });
 }
 
@@ -1859,8 +1906,6 @@ function registerEvents() {
     eventSource.on(event_types.CHAT_CHANGED, () => {
         renderGallery();
         refreshWidgetState();
-        // Give ST a moment to render messages before attaching regen buttons
-        setTimeout(attachAllRegenButtons, 300);
     });
 }
 
@@ -1872,6 +1917,7 @@ jQuery(async () => {
     renderSettingsPanel();
     createFloatingWidget();
     registerEvents();
+    registerSwipeHandler();
 
     registerSlashCommand(
         "img2img",
@@ -1882,5 +1928,5 @@ jQuery(async () => {
         true
     );
 
-    console.log("[Img2Img] Extension ready (v0.14.0). Floating widget active.");
+    console.log("[Img2Img] Extension ready (v0.15.0). Floating widget active.");
 });

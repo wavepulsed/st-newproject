@@ -882,37 +882,34 @@ async function widgetGenerate() {
 }
 
 function initTextareaResize($container, $grip, $textarea) {
-    let resizing  = false;
-    let startY, startH, startBottom;
+    let resizing = false;
+    let startY, startH;
 
     $grip.on("mousedown", (e) => {
-        resizing    = true;
-        startY      = e.clientY;
-        startH      = $textarea.outerHeight();
-        startBottom = parseInt($container.css("bottom")) || 80;
+        const $panel = $("#img2img_widget_panel");
+        const rect   = $panel[0].getBoundingClientRect();
+
+        // Convert panel to top-anchored so it grows downward during resize
+        $panel.css({ top: rect.top + "px", bottom: "auto" });
+
+        resizing = true;
+        startY   = e.clientY;
+        startH   = $textarea.outerHeight();
         e.preventDefault();
-        e.stopPropagation(); // don't trigger widget drag
+        e.stopPropagation(); // don't trigger FAB or handle drag
     });
 
     $(document).on("mousemove.img2img_resize", (e) => {
         if (!resizing) return;
-        const delta  = e.clientY - startY;
-        const newH   = Math.max(60, startH + delta);
-        const fabH   = $container.outerHeight() || 56;
-        const maxBottom = window.innerHeight - fabH;
-        const newBottom = Math.min(maxBottom, Math.max(0, startBottom - delta));
-        $textarea.css("min-height", newH + "px").css("height", newH + "px");
-        $container.css("bottom", newBottom + "px");
+        const delta = e.clientY - startY;
+        const newH  = Math.max(60, startH + delta);
+        $textarea.css({ "min-height": newH + "px", height: newH + "px" });
     });
 
     $(document).on("mouseup.img2img_resize", () => {
         if (!resizing) return;
         resizing = false;
-        getSettings().widget_position = {
-            right:  parseInt($container.css("right"))  || 20,
-            bottom: parseInt($container.css("bottom")) || 80,
-        };
-        saveSettingsDebounced();
+        // No container/position save needed — resize only affects textarea height
     });
 }
 

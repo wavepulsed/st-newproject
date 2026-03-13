@@ -360,7 +360,8 @@ async function injectImageIntoChat(localPath, prompt) {
         mes: "",
         swipes: [""],
         swipe_id: 0,
-        swipe_info: [{ send_date: new Date().toISOString(), gen_started: null, gen_finished: null, extra: { img2img: true } }],
+        swipe_info: [{ send_date: new Date().toISOString(), gen_started: null, gen_finished: null, extra: { img2img: true, title: prompt } }],
+        img2img_prompt: prompt,
         extra: { isSmallSys: false, img2img: true, image: localPath, title: prompt },
     };
     context.chat.push(message);
@@ -489,7 +490,8 @@ async function swipeRegenMessage(messageIndex) {
     const message = context.chat[messageIndex];
     if (!message?.extra?.img2img) return;
 
-    const finalPrompt = message.extra.title;
+    const finalPrompt = message.img2img_prompt || message.extra?.title
+        || message.swipe_info?.[0]?.extra?.title;
     if (!finalPrompt) { toastr.warning("No prompt stored on this message — can't regenerate."); return; }
 
     showLoadingMessage();
@@ -504,7 +506,7 @@ async function swipeRegenMessage(messageIndex) {
             send_date:    new Date().toISOString(),
             gen_started:  null,
             gen_finished: null,
-            extra: { img2img: true },
+            extra: { img2img: true, title: finalPrompt },
         };
         message.swipes.push("");
         message.swipe_info.push(newSwipeInfo);

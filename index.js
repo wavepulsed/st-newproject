@@ -528,24 +528,32 @@ async function swipeRegenMessage(messageIndex) {
 }
 
 function registerSwipeHandler() {
-    // Delegated — catches swipe_right clicks on img2img messages
-    $(document).off("click.img2img_swipe").on("click.img2img_swipe", ".swipe_right", async function () {
-        const $mes = $(this).closest(".mes");
-        const mesId = parseInt($mes.attr("mesid"));
+    // Delegated — intercepts swipe_right clicks on img2img messages
+    // Must use capture phase (true) to fire before ST's own handlers
+    document.addEventListener("click", function (e) {
+        const swipeBtn = e.target.closest(".swipe_right");
+        if (!swipeBtn) return;
+
+        const mesBlock = swipeBtn.closest(".mes");
+        if (!mesBlock) return;
+
+        const mesId = parseInt(mesBlock.getAttribute("mesid"));
         if (isNaN(mesId)) return;
 
         const context = getContext();
         const message = context?.chat?.[mesId];
         if (!message?.extra?.img2img) return;
 
-        // Only intercept when on the last swipe (i.e. this would generate a new one)
+        // Only intercept on the last swipe — earlier swipes navigate normally
         const isLastSwipe = message.swipe_id >= message.swipes.length - 1;
         if (!isLastSwipe) return;
 
-        // Let ST's own handler update swipe_id first, then we override
-        // Use a short delay so we run after ST's click handler
-        setTimeout(() => swipeRegenMessage(mesId), 50);
-    });
+        // Stop ST from handling this click entirely
+        e.stopImmediatePropagation();
+        e.preventDefault();
+
+        swipeRegenMessage(mesId);
+    }, true); // capture phase — fires before ST's bubble-phase handlers
 }
 
 // ── Floating widget ───────────────────────────────────────────────────────────

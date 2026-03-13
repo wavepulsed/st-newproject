@@ -485,6 +485,22 @@ async function handleGenerateCommand(namedArgs, unnamedValue) {
 
 // ── Swipe / regen support ─────────────────────────────────────────────────────
 
+function updateMesImage(messageIndex, localPath) {
+    // Directly swap the image src in the DOM — no re-render, no addOneMessage chaos
+    const $mes = $(`.mes[mesid="${messageIndex}"]`);
+    let $img   = $mes.find(".mes_img_container img");
+
+    if ($img.length) {
+        $img.attr("src", localPath);
+    } else {
+        // Image element not present yet (e.g. first regen on a message rendered without one)
+        // Fall back to full re-render only in this edge case
+        $mes.remove();
+        const context = getContext();
+        addOneMessage(context.chat[messageIndex], { type: "normal", insertAt: messageIndex });
+    }
+}
+
 async function swipeRegenMessage(messageIndex) {
     const context = getContext();
     const message = context.chat[messageIndex];
@@ -501,24 +517,18 @@ async function swipeRegenMessage(messageIndex) {
         const localPath = await fetchAndSaveImage(remoteUrl, charName);
         hideLoadingMessage();
 
-        // Add new image as a fresh swipe entry
-        const newSwipeInfo = {
-            send_date:    new Date().toISOString(),
-            gen_started:  null,
-            gen_finished: null,
-            extra: { img2img: true, title: finalPrompt, image: localPath },
-        };
+        // Push new swipe entry with its own image path
         message.swipes.push("");
-        message.swipe_info.push(newSwipeInfo);
+        message.swipe_info.push({
+            send_date: new Date().toISOString(),
+            gen_started: null, gen_finished: null,
+            extra: { img2img: true, title: finalPrompt, image: localPath },
+        });
         message.swipe_id    = message.swipes.length - 1;
+        message.extra.image = localPath;
 
-        // Set extra.image from the current swipe's stored path before re-rendering
-        message.extra.image = message.swipe_info[message.swipe_id].extra.image;
-
-        // Re-render the message in place
-        const $old = $(`.mes[mesid="${messageIndex}"]`);
-        $old.remove();
-        await addOneMessage(message, { type: "normal", insertAt: messageIndex });
+        // Update DOM image directly — never re-inject into context.chat
+        updateMesImage(messageIndex, localPath);
 
         await saveChatDebounced();
         toastr.success("Image regenerated.");
@@ -544,27 +554,33 @@ function registerSwipeHandler() {
         const message = context?.chat?.[mesId];
         if (!message?.extra?.img2img) return;
 
-        const isRight    = swipeBtn.classList.contains("swipe_right");
+        // Fully intercept ALL swipe clicks on img2img messages —
+        // we manage swipe_id and rendering ourselves, ST never touches these
+        e.stopImmediatePropagation();
+        e.preventDefault();
+
+        const isRight     = swipeBtn.classList.contains("swipe_right");
         const isLastSwipe = message.swipe_id >= message.swipes.length - 1;
 
         if (isRight && isLastSwipe) {
-            // Last swipe right — intercept fully, generate new image
-            e.stopImmediatePropagation();
-            e.preventDefault();
+            // Generate a brand new swipe
             swipeRegenMessage(mesId);
         } else {
-            // Navigation between existing swipes — let ST update swipe_id,
-            // then sync extra.image from swipe_info and re-render
-            setTimeout(async () => {
-                const img = message.swipe_info?.[message.swipe_id]?.extra?.image;
-                if (!img) return;
-                message.extra.image = img;
+            // Navigate between existing swipes
+            const total = message.swipes.length;
+            if (isRight) message.swipe_id = Math.min(total - 1, message.swipe_id + 1);
+            else          message.swipe_id = Math.max(0,         message.swipe_id - 1);
 
-                const $old = $(`.mes[mesid="${mesId}"]`);
-                $old.remove();
-                await addOneMessage(message, { type: "normal", insertAt: mesId });
-                await saveChatDebounced();
-            }, 50);
+            const img = message.swipe_info?.[message.swipe_id]?.extra?.image;
+            if (!img) return;
+            message.extra.image = img;
+
+            // Update image src and swipe counter directly in DOM
+            updateMesImage(mesId, img);
+            $(`.mes[mesid="${mesId}"]`).find(".swipes-counter")
+                .text(`${message.swipe_id + 1}/${total}`);
+
+            saveChatDebounced();
         }
     }, true);
 }

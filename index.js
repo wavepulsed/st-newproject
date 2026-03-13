@@ -917,30 +917,42 @@ function initTextareaResize($container, $grip, $textarea) {
 }
 
 function initWidgetDrag($container, $handle, $fab) {
-    let dragging  = false;
-    let didDrag   = false;
-    let startX, startY, startRight, startBottom;
+    let dragging    = false;
+    let didDrag     = false;
+    let dragTarget  = null; // "fab" | "panel"
+    let startX, startY;
+    // FAB drag state (right/bottom)
+    let startRight, startBottom;
+    // Panel drag state (top/left)
+    let startPanelLeft, startPanelTop;
 
-    function beginDrag(e) {
-        dragging  = true;
-        didDrag   = false;
+    // ── FAB drag — moves the container (right/bottom) ──
+    $fab.on("mousedown", (e) => {
+        dragging    = true;
+        didDrag     = false;
+        dragTarget  = "fab";
         startX      = e.clientX;
         startY      = e.clientY;
         startRight  = parseInt($container.css("right"))  || 20;
         startBottom = parseInt($container.css("bottom")) || 80;
         $handle.addClass("dragging");
         e.preventDefault();
-    }
-
-    // Drag from handle (skip close button)
-    $handle.on("mousedown", (e) => {
-        if ($(e.target).is("button")) return;
-        beginDrag(e);
     });
 
-    // Drag from FAB — but still allow a clean click to toggle
-    $fab.on("mousedown", (e) => {
-        beginDrag(e);
+    // ── Handle drag — moves the panel directly (top/left) ──
+    $handle.on("mousedown", (e) => {
+        if ($(e.target).is("button")) return;
+        const $panel = $("#img2img_widget_panel");
+        const rect   = $panel[0].getBoundingClientRect();
+        dragging       = true;
+        didDrag        = false;
+        dragTarget     = "panel";
+        startX         = e.clientX;
+        startY         = e.clientY;
+        startPanelLeft = rect.left;
+        startPanelTop  = rect.top;
+        $handle.addClass("dragging");
+        e.preventDefault();
     });
 
     $(document).on("mousemove.img2img_drag", (e) => {
@@ -948,20 +960,30 @@ function initWidgetDrag($container, $handle, $fab) {
         const dx = e.clientX - startX;
         const dy = e.clientY - startY;
         if (Math.abs(dx) > 3 || Math.abs(dy) > 3) didDrag = true;
-        const fabW = $container.outerWidth()  || 56;
-        const fabH = $container.outerHeight() || 56;
-        const maxRight  = window.innerWidth  - fabW;
-        const maxBottom = window.innerHeight - fabH;
-        const newRight  = Math.min(maxRight,  Math.max(0, startRight  - dx));
-        const newBottom = Math.min(maxBottom, Math.max(0, startBottom - dy));
-        $container.css({ right: newRight + "px", bottom: newBottom + "px" });
+
+        if (dragTarget === "fab") {
+            const fabW = $container.outerWidth()  || 56;
+            const fabH = $container.outerHeight() || 56;
+            const maxRight  = window.innerWidth  - fabW;
+            const maxBottom = window.innerHeight - fabH;
+            const newRight  = Math.min(maxRight,  Math.max(0, startRight  - dx));
+            const newBottom = Math.min(maxBottom, Math.max(0, startBottom - dy));
+            $container.css({ right: newRight + "px", bottom: newBottom + "px" });
+        } else {
+            const $panel  = $("#img2img_widget_panel");
+            const panelW  = $panel.outerWidth()  || 310;
+            const panelH  = $panel.outerHeight() || 320;
+            const newLeft = Math.min(window.innerWidth  - panelW - 4, Math.max(4, startPanelLeft + dx));
+            const newTop  = Math.min(window.innerHeight - panelH - 4, Math.max(4, startPanelTop  + dy));
+            $panel.css({ left: newLeft + "px", top: newTop + "px", right: "auto", bottom: "auto" });
+        }
     });
 
     $(document).on("mouseup.img2img_drag", () => {
         if (!dragging) return;
         dragging = false;
         $handle.removeClass("dragging");
-        if (didDrag) {
+        if (didDrag && dragTarget === "fab") {
             getSettings().widget_position = {
                 right:  parseInt($container.css("right"))  || 20,
                 bottom: parseInt($container.css("bottom")) || 80,
@@ -969,9 +991,8 @@ function initWidgetDrag($container, $handle, $fab) {
             saveSettingsDebounced();
             _fabDragJustOccurred = true;
         }
+        dragTarget = null;
     });
-
-
 }
 
 

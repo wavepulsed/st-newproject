@@ -527,8 +527,11 @@ async function swipeRegenMessage(messageIndex) {
         message.swipe_id    = message.swipes.length - 1;
         message.extra.image = localPath;
 
-        // Update DOM image directly — never re-inject into context.chat
+        // Update DOM image and swipe counter directly
         updateMesImage(messageIndex, localPath);
+        const total = message.swipes.length;
+        $(`.mes[mesid="${messageIndex}"]`).find(".swipes-counter")
+            .text(`${message.swipe_id + 1}/${total}`);
 
         await saveChatDebounced();
         toastr.success("Image regenerated.");

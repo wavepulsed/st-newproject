@@ -530,10 +530,8 @@ async function swipeRegenMessage(messageIndex) {
 }
 
 function registerSwipeHandler() {
-    // Delegated — intercepts swipe_right clicks on img2img messages
-    // Must use capture phase (true) to fire before ST's own handlers
-    document.addEventListener("click", function (e) {
-        const swipeBtn = e.target.closest(".swipe_right");
+    document.addEventListener("click", async function (e) {
+        const swipeBtn = e.target.closest(".swipe_right, .swipe_left");
         if (!swipeBtn) return;
 
         const mesBlock = swipeBtn.closest(".mes");
@@ -546,16 +544,29 @@ function registerSwipeHandler() {
         const message = context?.chat?.[mesId];
         if (!message?.extra?.img2img) return;
 
-        // Only intercept on the last swipe — earlier swipes navigate normally
+        const isRight    = swipeBtn.classList.contains("swipe_right");
         const isLastSwipe = message.swipe_id >= message.swipes.length - 1;
-        if (!isLastSwipe) return;
 
-        // Stop ST from handling this click entirely
-        e.stopImmediatePropagation();
-        e.preventDefault();
+        if (isRight && isLastSwipe) {
+            // Last swipe right — intercept fully, generate new image
+            e.stopImmediatePropagation();
+            e.preventDefault();
+            swipeRegenMessage(mesId);
+        } else {
+            // Navigation between existing swipes — let ST update swipe_id,
+            // then sync extra.image from swipe_info and re-render
+            setTimeout(async () => {
+                const img = message.swipe_info?.[message.swipe_id]?.extra?.image;
+                if (!img) return;
+                message.extra.image = img;
 
-        swipeRegenMessage(mesId);
-    }, true); // capture phase — fires before ST's bubble-phase handlers
+                const $old = $(`.mes[mesid="${mesId}"]`);
+                $old.remove();
+                await addOneMessage(message, { type: "normal", insertAt: mesId });
+                await saveChatDebounced();
+            }, 50);
+        }
+    }, true);
 }
 
 // ── Floating widget ───────────────────────────────────────────────────────────

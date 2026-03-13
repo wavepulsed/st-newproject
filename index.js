@@ -1,5 +1,5 @@
 // Img2Img Reference Generator for SillyTavern
-// Version 0.13.2 — FAB drag click fix, set reordering
+// Version 0.14.0 — Inline input, regen support
 
 import { extension_settings, getContext } from "../../../extensions.js";
 import { saveSettingsDebounced, eventSource, event_types, saveChatDebounced, addOneMessage } from "../../../../script.js";
@@ -368,6 +368,10 @@ async function injectImageIntoChat(localPath, prompt) {
     await addOneMessage(message, { type: "normal", insertAt: messageIndex });
     await saveChatDebounced();
     $("#chat").scrollTop($("#chat")[0].scrollHeight);
+
+    // Attach regen button to the newly rendered message
+    const $newBlock = $(`.mes[mesid="${messageIndex}"]`);
+    attachRegenButton($newBlock, prompt);
 }
 
 // ── Loading indicator ─────────────────────────────────────────────────────────
@@ -482,6 +486,70 @@ async function handleGenerateCommand(namedArgs, unnamedValue) {
     }
 }
 
+// ── Regen support ─────────────────────────────────────────────────────────────
+
+function injectRegenStyles() {
+    if ($("#img2img_regen_styles").length) return;
+    $("head").append(`<style id="img2img_regen_styles">
+        .img2img_regen_btn {
+            position: absolute; bottom: 6px; right: 6px;
+            padding: 3px 9px; font-size: 0.73em;
+            background: rgba(155,114,232,0.18);
+            border: 1px solid rgba(155,114,232,0.35);
+            border-radius: 6px; cursor: pointer; color: inherit;
+            opacity: 0; transition: opacity 0.15s, background 0.1s;
+            z-index: 10;
+        }
+        .img2img_regen_btn:hover { background: rgba(155,114,232,0.38); }
+        .mes_img_container:hover .img2img_regen_btn,
+        .img2img_regen_btn:focus { opacity: 1; }
+        .img2img_regen_btn.spinning { opacity: 0.5; pointer-events: none; }
+    </style>`);
+}
+
+async function regenFromPrompt(finalPrompt) {
+    showLoadingMessage();
+    try {
+        const charName  = getCurrentCharacterName();
+        const remoteUrl = await generateImage(finalPrompt);
+        const localPath = await fetchAndSaveImage(remoteUrl, charName);
+        hideLoadingMessage();
+        await injectImageIntoChat(localPath, finalPrompt);
+        toastr.success("Image regenerated.");
+    } catch (err) {
+        hideLoadingMessage();
+        console.error("[Img2Img] Regen failed:", err);
+        toastr.error(`Regen failed: ${err.message}`);
+    }
+}
+
+function attachRegenButton($mesBlock, finalPrompt) {
+    if (!finalPrompt) return;
+    if ($mesBlock.find(".img2img_regen_btn").length) return; // already attached
+
+    const $imgContainer = $mesBlock.find(".mes_img_container");
+    if (!$imgContainer.length) return;
+
+    const $btn = $(`<button class="img2img_regen_btn" title="Regenerate this image">↺ Regen</button>`);
+    $btn.on("click", async () => {
+        $btn.addClass("spinning").text("…");
+        await regenFromPrompt(finalPrompt);
+        $btn.removeClass("spinning").text("↺ Regen");
+    });
+    $imgContainer.css("position", "relative").append($btn);
+}
+
+function attachAllRegenButtons() {
+    const context = getContext();
+    if (!context?.chat) return;
+
+    context.chat.forEach((msg, idx) => {
+        if (!msg.extra?.img2img || !msg.extra?.title) return;
+        const $mesBlock = $(`.mes[mesid="${idx}"]`);
+        if ($mesBlock.length) attachRegenButton($mesBlock, msg.extra.title);
+    });
+}
+
 // ── Floating widget ───────────────────────────────────────────────────────────
 
 function getWidgetIconSrc() {
@@ -492,6 +560,7 @@ function getWidgetIconSrc() {
 
 function injectWidgetStyles() {
     if ($("#img2img_widget_styles").length) return;
+    injectRegenStyles();
     $("head").append(`<style id="img2img_widget_styles">
         #img2img_widget_container {
             position: fixed;
@@ -1209,20 +1278,24 @@ function openSetManager() {
                 renderSetMgr();
             });
 
-            $row.find(".rename-btn").on("click", async () => {
-                const newName = prompt_input("Rename set:", name);
-                if (!newName?.trim() || newName.trim() === name) return;
-                const trimmed = newName.trim();
-                const r = await loadRecordFromDB(charName);
-                if (r.sets[trimmed]) { toastr.warning(`"${trimmed}" already exists.`); return; }
-                r.sets[trimmed] = r.sets[name];
-                delete r.sets[name];
-                if (r.activeSet === name) r.activeSet = trimmed;
-                await saveRecordToDB(r);
-                toastr.success(`Renamed to "${trimmed}".`);
-                refreshWidgetState();
-                renderGallery();
-                renderSetMgr();
+            $row.find(".rename-btn").on("click", () => {
+                showInlineInput({
+                    title: `Rename "${name}"`,
+                    defaultValue: name,
+                    onConfirm: async (trimmed) => {
+                        if (trimmed === name) return;
+                        const r = await loadRecordFromDB(charName);
+                        if (r.sets[trimmed]) { toastr.warning(`"${trimmed}" already exists.`); return; }
+                        r.sets[trimmed] = r.sets[name];
+                        delete r.sets[name];
+                        if (r.activeSet === name) r.activeSet = trimmed;
+                        await saveRecordToDB(r);
+                        toastr.success(`Renamed to "${trimmed}".`);
+                        refreshWidgetState();
+                        renderGallery();
+                        renderSetMgr();
+                    },
+                });
             });
 
             $row.find(".delete-btn").on("click", async () => {
@@ -1468,34 +1541,42 @@ async function renderGallery() {
         renderGallery();
     });
 
-    $newBtn.on("click", async () => {
-        const name = prompt_input("Name for new set:", "New Set");
-        if (!name?.trim()) return;
-        const trimmed = name.trim();
-        const rec = await loadRecordFromDB(charName);
-        if (rec.sets[trimmed]) { toastr.warning(`A set named "${trimmed}" already exists.`); return; }
-        rec.sets[trimmed] = [];
-        rec.activeSet = trimmed;
-        await saveRecordToDB(rec);
-        toastr.success(`Set "${trimmed}" created.`);
-        renderGallery();
-        refreshWidgetState();
+    $newBtn.on("click", () => {
+        showInlineInput({
+            title: "New Set Name",
+            placeholder: "e.g. Beach Outfit",
+            onConfirm: async (trimmed) => {
+                const rec = await loadRecordFromDB(charName);
+                if (rec.sets[trimmed]) { toastr.warning(`A set named "${trimmed}" already exists.`); return; }
+                rec.sets[trimmed] = [];
+                rec.activeSet = trimmed;
+                await saveRecordToDB(rec);
+                toastr.success(`Set "${trimmed}" created.`);
+                renderGallery();
+                refreshWidgetState();
+            },
+        });
     });
 
     $renameBtn.on("click", async () => {
         const rec = await loadRecordFromDB(charName);
         const oldName = rec.activeSet;
-        const newName = prompt_input("Rename set:", oldName);
-        if (!newName?.trim() || newName.trim() === oldName) return;
-        const trimmed = newName.trim();
-        if (rec.sets[trimmed]) { toastr.warning(`A set named "${trimmed}" already exists.`); return; }
-        rec.sets[trimmed] = rec.sets[oldName];
-        delete rec.sets[oldName];
-        rec.activeSet = trimmed;
-        await saveRecordToDB(rec);
-        toastr.success(`Set renamed to "${trimmed}".`);
-        renderGallery();
-        refreshWidgetState();
+        showInlineInput({
+            title: `Rename "${oldName}"`,
+            defaultValue: oldName,
+            onConfirm: async (trimmed) => {
+                if (trimmed === oldName) return;
+                const r = await loadRecordFromDB(charName);
+                if (r.sets[trimmed]) { toastr.warning(`A set named "${trimmed}" already exists.`); return; }
+                r.sets[trimmed] = r.sets[oldName];
+                delete r.sets[oldName];
+                r.activeSet = trimmed;
+                await saveRecordToDB(r);
+                toastr.success(`Set renamed to "${trimmed}".`);
+                renderGallery();
+                refreshWidgetState();
+            },
+        });
     });
 
     $deleteBtn.on("click", async () => {
@@ -1512,8 +1593,97 @@ async function renderGallery() {
     });
 }
 
-function prompt_input(message, defaultValue) {
-    return window.prompt(message, defaultValue);
+// ── Inline input (replaces window.prompt) ────────────────────────────────────
+
+function showInlineInput({ title, defaultValue = "", placeholder = "", onConfirm }) {
+    if (!$("#img2img_inline_input_styles").length) {
+        $("head").append(`<style id="img2img_inline_input_styles">
+            #img2img_inline_overlay {
+                position: fixed; inset: 0; z-index: 10500;
+                background: rgba(0,0,0,0.45);
+                display: flex; align-items: center; justify-content: center;
+            }
+            #img2img_inline_box {
+                background: var(--SmartThemeBlurTintColor, #1c1b2e);
+                border: 1px solid rgba(155,114,232,0.28);
+                border-radius: 12px;
+                box-shadow: 0 12px 40px rgba(0,0,0,0.75);
+                padding: 18px 20px 16px;
+                width: 300px; max-width: 92vw;
+                animation: img2img_fadein 0.12s ease;
+                display: flex; flex-direction: column; gap: 10px;
+            }
+            #img2img_inline_title {
+                font-size: 0.82em; font-weight: 700;
+                color: rgba(255,255,255,0.65);
+                letter-spacing: 0.04em;
+            }
+            #img2img_inline_input {
+                width: 100%; padding: 7px 10px; font-size: 0.85em;
+                background: rgba(0,0,0,0.25);
+                border: 1px solid rgba(255,255,255,0.09);
+                border-radius: 7px; color: inherit; font-family: inherit;
+                box-sizing: border-box;
+            }
+            #img2img_inline_input:focus {
+                border-color: rgba(155,114,232,0.5); outline: none;
+            }
+            .img2img_inline_btns {
+                display: flex; gap: 7px; justify-content: flex-end;
+            }
+            .img2img_inline_btn {
+                padding: 5px 14px; font-size: 0.8em; border-radius: 7px;
+                cursor: pointer; color: inherit; transition: background 0.1s;
+            }
+            .img2img_inline_btn.cancel {
+                background: rgba(255,255,255,0.06);
+                border: 1px solid rgba(255,255,255,0.1);
+            }
+            .img2img_inline_btn.cancel:hover { background: rgba(255,255,255,0.12); }
+            .img2img_inline_btn.confirm {
+                background: rgba(155,114,232,0.2);
+                border: 1px solid rgba(155,114,232,0.38);
+            }
+            .img2img_inline_btn.confirm:hover { background: rgba(155,114,232,0.35); }
+        </style>`);
+    }
+
+    $("#img2img_inline_overlay").remove();
+
+    const $overlay = $(`
+        <div id="img2img_inline_overlay">
+            <div id="img2img_inline_box">
+                <div id="img2img_inline_title">${title}</div>
+                <input id="img2img_inline_input" type="text"
+                       placeholder="${placeholder}"
+                       value="${defaultValue}" />
+                <div class="img2img_inline_btns">
+                    <button class="img2img_inline_btn cancel">Cancel</button>
+                    <button class="img2img_inline_btn confirm">OK</button>
+                </div>
+            </div>
+        </div>
+    `);
+
+    $("body").append($overlay);
+    const $input = $("#img2img_inline_input");
+    $input.focus().select();
+
+    const close = () => $("#img2img_inline_overlay").remove();
+
+    const confirm = () => {
+        const val = $input.val().trim();
+        close();
+        if (val) onConfirm(val);
+    };
+
+    $overlay.find(".confirm").on("click", confirm);
+    $overlay.find(".cancel").on("click", close);
+    $overlay.on("click", (e) => { if ($(e.target).is("#img2img_inline_overlay")) close(); });
+    $input.on("keydown", (e) => {
+        if (e.key === "Enter")  confirm();
+        if (e.key === "Escape") close();
+    });
 }
 
 // ── File upload ───────────────────────────────────────────────────────────────
@@ -1689,6 +1859,8 @@ function registerEvents() {
     eventSource.on(event_types.CHAT_CHANGED, () => {
         renderGallery();
         refreshWidgetState();
+        // Give ST a moment to render messages before attaching regen buttons
+        setTimeout(attachAllRegenButtons, 300);
     });
 }
 
@@ -1710,5 +1882,5 @@ jQuery(async () => {
         true
     );
 
-    console.log("[Img2Img] Extension ready (v0.13.2). Floating widget active.");
+    console.log("[Img2Img] Extension ready (v0.14.0). Floating widget active.");
 });

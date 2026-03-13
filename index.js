@@ -360,7 +360,7 @@ async function injectImageIntoChat(localPath, prompt) {
         mes: "",
         swipes: [""],
         swipe_id: 0,
-        swipe_info: [{ send_date: new Date().toISOString(), gen_started: null, gen_finished: null, extra: { img2img: true, title: prompt } }],
+        swipe_info: [{ send_date: new Date().toISOString(), gen_started: null, gen_finished: null, extra: { img2img: true, title: prompt, image: localPath } }],
         img2img_prompt: prompt,
         extra: { isSmallSys: false, img2img: true, image: localPath, title: prompt },
     };
@@ -506,12 +506,14 @@ async function swipeRegenMessage(messageIndex) {
             send_date:    new Date().toISOString(),
             gen_started:  null,
             gen_finished: null,
-            extra: { img2img: true, title: finalPrompt },
+            extra: { img2img: true, title: finalPrompt, image: localPath },
         };
         message.swipes.push("");
         message.swipe_info.push(newSwipeInfo);
-        message.swipe_id   = message.swipes.length - 1;
-        message.extra.image = localPath;
+        message.swipe_id    = message.swipes.length - 1;
+
+        // Set extra.image from the current swipe's stored path before re-rendering
+        message.extra.image = message.swipe_info[message.swipe_id].extra.image;
 
         // Re-render the message in place
         const $old = $(`.mes[mesid="${messageIndex}"]`);

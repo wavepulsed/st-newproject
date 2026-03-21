@@ -1,5 +1,5 @@
 // Img2Img Reference Generator for SillyTavern
-// Version 0.15.0 — Native swipe regen, styled confirm dialogs
+// Version 0.15.1 — Prompt enhancement profiles
 
 import { extension_settings, getContext } from "../../../extensions.js";
 import { saveSettingsDebounced, eventSource, event_types, saveChatDebounced, addOneMessage } from "../../../../script.js";
@@ -164,6 +164,8 @@ const defaultSettings = {
     auto_prompt_context_messages: 10,
     widget_icon: null,
     widget_position: { bottom: 80, right: 20 },
+    profiles: [],
+    active_profile: null,
 };
 
 function loadSettings() {
@@ -187,19 +189,29 @@ function getCurrentCharacterName() {
 
 // ── Prompt assembly ───────────────────────────────────────────────────────────
 
+function getActiveProfile() {
+    const s = getSettings();
+    if (!s.active_profile) return null;
+    return s.profiles.find(p => p.name === s.active_profile) || null;
+}
+
 async function getEffectivePrefix(charName) {
     if (charName) {
         const record = await loadRecordFromDB(charName);
-        if (record.char_prefix && record.char_prefix.trim()) return record.char_prefix.trim();
+        if (record.char_prefix?.trim()) return record.char_prefix.trim();
     }
+    const profile = getActiveProfile();
+    if (profile?.prefix?.trim()) return profile.prefix.trim();
     return getSettings().global_prefix.trim();
 }
 
 async function getEffectiveSuffix(charName) {
     if (charName) {
         const record = await loadRecordFromDB(charName);
-        if (record.char_suffix && record.char_suffix.trim()) return record.char_suffix.trim();
+        if (record.char_suffix?.trim()) return record.char_suffix.trim();
     }
+    const profile = getActiveProfile();
+    if (profile?.suffix?.trim()) return profile.suffix.trim();
     return getSettings().global_suffix.trim();
 }
 
@@ -779,6 +791,12 @@ function createFloatingWidget() {
                 </div>
 
                 <div class="img2img_widget_row">
+                    <span class="img2img_widget_label">Profile</span>
+                    <select id="img2img_widget_profile" class="img2img_widget_select"></select>
+                    <button class="img2img_wgt_iconbtn" id="img2img_wgt_manage_profiles" title="Manage profiles">⚙ Manage</button>
+                </div>
+
+                <div class="img2img_widget_row">
                     <span class="img2img_widget_label">Size</span>
                     <select id="img2img_widget_size" class="img2img_widget_select"></select>
                 </div>
@@ -841,6 +859,15 @@ function createFloatingWidget() {
         refreshWidgetState();
         renderGallery();
     });
+
+    // ── Profile dropdown ──
+    $("#img2img_widget_profile").on("change", function () {
+        const val = $(this).val();
+        getSettings().active_profile = val === "__none__" ? null : val;
+        saveSettingsDebounced();
+    });
+
+    $("#img2img_wgt_manage_profiles").on("click", () => openProfileManager());
 
     // ── Size dropdown ──
     $("#img2img_widget_size").on("change", function () {
@@ -919,6 +946,16 @@ async function refreshWidgetState() {
     } else {
         $setSelect.append(`<option disabled>— no character —</option>`);
     }
+
+    // Profile dropdown
+    const $profileSelect = $("#img2img_widget_profile");
+    $profileSelect.empty();
+    const settings2 = getSettings();
+    $profileSelect.append(`<option value="__none__"${!settings2.active_profile ? " selected" : ""}>— None —</option>`);
+    settings2.profiles.forEach(p => {
+        const sel = p.name === settings2.active_profile ? " selected" : "";
+        $profileSelect.append(`<option value="${p.name}"${sel}>${p.name}</option>`);
+    });
 
     // Size dropdown (exclude "custom" — handled in settings panel)
     const $sizeSelect = $("#img2img_widget_size");
@@ -1119,6 +1156,339 @@ async function moveSet(charName, setName, direction) {
     await saveRecordToDB(rec);
     refreshWidgetState();
     renderGallery();
+}
+
+// ── Profile Manager modal ────────────────────────────────────────────────────
+
+function openProfileManager() {
+    if (!$("#img2img_profmgr_styles").length) {
+        $("head").append(`<style id="img2img_profmgr_styles">
+            #img2img_profmgr_overlay {
+                position: fixed; inset: 0; z-index: 10000;
+                background: rgba(0,0,0,0.62);
+                display: flex; align-items: center; justify-content: center;
+            }
+            #img2img_profmgr_modal {
+                width: 520px; max-width: 95vw; max-height: 90vh;
+                display: flex; flex-direction: column;
+                background: var(--SmartThemeBlurTintColor, #1c1b2e);
+                border: 1px solid rgba(155,114,232,0.22);
+                border-radius: 16px;
+                box-shadow: 0 18px 54px rgba(0,0,0,0.80);
+                animation: img2img_fadein 0.14s ease;
+                overflow: hidden;
+            }
+            #img2img_profmgr_header {
+                display: flex; align-items: center; justify-content: space-between;
+                padding: 14px 18px 12px;
+                background: rgba(155,114,232,0.08);
+                border-bottom: 1px solid rgba(255,255,255,0.055);
+                flex-shrink: 0;
+            }
+            #img2img_profmgr_title {
+                font-size: 0.88em; font-weight: 700; letter-spacing: 0.06em;
+            }
+            #img2img_profmgr_close {
+                background: none; border: none;
+                color: rgba(255,255,255,0.3); cursor: pointer;
+                font-size: 1.05em; padding: 0; line-height: 1;
+                transition: color 0.12s;
+            }
+            #img2img_profmgr_close:hover { color: rgba(255,255,255,0.85); }
+            #img2img_profmgr_body {
+                display: flex; flex: 1; overflow: hidden;
+            }
+            #img2img_profmgr_list_col {
+                width: 180px; flex-shrink: 0;
+                border-right: 1px solid rgba(255,255,255,0.055);
+                display: flex; flex-direction: column;
+                overflow-y: auto;
+            }
+            #img2img_profmgr_list {
+                flex: 1; display: flex; flex-direction: column; gap: 3px;
+                padding: 10px 8px;
+            }
+            .img2img_profmgr_row {
+                padding: 7px 10px; border-radius: 7px;
+                font-size: 0.83em; font-weight: 600; cursor: pointer;
+                border: 1px solid transparent;
+                transition: background 0.1s, border-color 0.1s;
+                display: flex; align-items: center; justify-content: space-between;
+                gap: 4px;
+            }
+            .img2img_profmgr_row:hover { background: rgba(255,255,255,0.06); }
+            .img2img_profmgr_row.active {
+                background: rgba(155,114,232,0.1);
+                border-color: rgba(155,114,232,0.35);
+            }
+            .img2img_profmgr_row_name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+            .img2img_profmgr_del {
+                background: none; border: none; color: rgba(255,255,255,0.25);
+                cursor: pointer; font-size: 0.85em; padding: 0 1px;
+                transition: color 0.12s; flex-shrink: 0;
+            }
+            .img2img_profmgr_del:hover { color: rgba(220,80,80,0.85); }
+            #img2img_profmgr_new_row {
+                padding: 8px; border-top: 1px solid rgba(255,255,255,0.055);
+                display: flex; gap: 5px; flex-shrink: 0;
+            }
+            #img2img_profmgr_new_input {
+                flex: 1; padding: 5px 8px; font-size: 0.78em;
+                background: rgba(0,0,0,0.22);
+                border: 1px solid rgba(255,255,255,0.09);
+                border-radius: 6px; color: inherit; font-family: inherit;
+            }
+            #img2img_profmgr_new_input:focus { border-color: rgba(155,114,232,0.45); outline: none; }
+            #img2img_profmgr_new_btn {
+                padding: 5px 10px; font-size: 0.78em;
+                background: rgba(155,114,232,0.18);
+                border: 1px solid rgba(155,114,232,0.32);
+                border-radius: 6px; cursor: pointer; color: inherit;
+                transition: background 0.1s; flex-shrink: 0;
+            }
+            #img2img_profmgr_new_btn:hover { background: rgba(155,114,232,0.32); }
+            #img2img_profmgr_edit_col {
+                flex: 1; display: flex; flex-direction: column;
+                padding: 16px 18px; gap: 14px; overflow-y: auto;
+            }
+            .img2img_profmgr_field { display: flex; flex-direction: column; gap: 5px; }
+            .img2img_profmgr_field_label {
+                font-size: 0.7em; font-weight: 700;
+                text-transform: uppercase; letter-spacing: 0.1em;
+                color: rgba(255,255,255,0.3);
+            }
+            .img2img_profmgr_field_name_row {
+                display: flex; gap: 7px; align-items: center;
+            }
+            .img2img_profmgr_input {
+                width: 100%; padding: 7px 10px; font-size: 0.82em;
+                background: rgba(0,0,0,0.22);
+                border: 1px solid rgba(255,255,255,0.09);
+                border-radius: 7px; color: inherit; font-family: inherit;
+                box-sizing: border-box;
+            }
+            .img2img_profmgr_input:focus { border-color: rgba(155,114,232,0.45); outline: none; }
+            .img2img_profmgr_textarea {
+                width: 100%; padding: 7px 10px; font-size: 0.82em;
+                background: rgba(0,0,0,0.22);
+                border: 1px solid rgba(255,255,255,0.09);
+                border-radius: 7px; color: inherit; font-family: inherit;
+                box-sizing: border-box; resize: vertical; min-height: 62px;
+            }
+            .img2img_profmgr_textarea:focus { border-color: rgba(155,114,232,0.45); outline: none; }
+            #img2img_profmgr_hint {
+                font-size: 0.78em; color: rgba(255,255,255,0.2);
+                display: flex; align-items: center; justify-content: center;
+                height: 100%;
+            }
+            #img2img_profmgr_active_badge {
+                font-size: 0.68em; padding: 2px 7px;
+                background: rgba(155,114,232,0.18);
+                border: 1px solid rgba(155,114,232,0.32);
+                border-radius: 10px; color: rgba(155,114,232,0.9);
+                cursor: pointer; white-space: nowrap;
+            }
+            #img2img_profmgr_active_badge.is-active {
+                background: rgba(155,114,232,0.32);
+                border-color: rgba(155,114,232,0.6);
+                color: #c9a6f7;
+            }
+        </style>`);
+    }
+
+    let selectedProfile = getSettings().active_profile || null;
+
+    function saveProfile(name, prefix, suffix) {
+        const s = getSettings();
+        const idx = s.profiles.findIndex(p => p.name === name);
+        if (idx >= 0) {
+            s.profiles[idx].prefix = prefix;
+            s.profiles[idx].suffix = suffix;
+        }
+        saveSettingsDebounced();
+        refreshWidgetState();
+    }
+
+    function renderProfileList() {
+        const s = getSettings();
+        const $list = $("#img2img_profmgr_list").empty();
+
+        if (!s.profiles.length) {
+            $list.append(`<div style="font-size:0.76em;color:rgba(255,255,255,0.2);padding:6px 4px;">No profiles yet</div>`);
+        }
+
+        s.profiles.forEach(p => {
+            const isActive  = p.name === s.active_profile;
+            const isSelected = p.name === selectedProfile;
+            const $row = $(`
+                <div class="img2img_profmgr_row${isSelected ? " active" : ""}" data-name="${p.name}">
+                    <span class="img2img_profmgr_row_name" title="${p.name}">${p.name}</span>
+                    <button class="img2img_profmgr_del" title="Delete">✕</button>
+                </div>
+            `);
+
+            $row.on("click", (e) => {
+                if ($(e.target).is(".img2img_profmgr_del")) return;
+                selectedProfile = p.name;
+                renderProfileList();
+                renderEditPanel();
+            });
+
+            $row.find(".img2img_profmgr_del").on("click", () => {
+                const count = s.profiles.length;
+                showConfirm({
+                    title: `Delete "${p.name}"?`,
+                    message: count <= 1 ? "This is your only profile." : "",
+                    onConfirm: () => {
+                        s.profiles = s.profiles.filter(x => x.name !== p.name);
+                        if (s.active_profile === p.name) s.active_profile = null;
+                        if (selectedProfile === p.name) selectedProfile = s.profiles[0]?.name || null;
+                        saveSettingsDebounced();
+                        refreshWidgetState();
+                        renderProfileList();
+                        renderEditPanel();
+                    },
+                });
+            });
+
+            $list.append($row);
+        });
+    }
+
+    function renderEditPanel() {
+        const $col = $("#img2img_profmgr_edit_col").empty();
+        const s = getSettings();
+
+        if (!selectedProfile) {
+            $col.append(`<div id="img2img_profmgr_hint">Select a profile to edit it</div>`);
+            return;
+        }
+
+        const profile = s.profiles.find(p => p.name === selectedProfile);
+        if (!profile) return;
+
+        const isActive = s.active_profile === selectedProfile;
+
+        $col.append(`
+            <div class="img2img_profmgr_field">
+                <div class="img2img_profmgr_field_label">Profile Name</div>
+                <div class="img2img_profmgr_field_name_row">
+                    <input class="img2img_profmgr_input" id="img2img_profmgr_name"
+                           value="${profile.name}" style="flex:1;" />
+                    <button id="img2img_profmgr_active_badge"
+                            class="${isActive ? "is-active" : ""}"
+                            title="${isActive ? "Currently active — click to deactivate" : "Click to set as active profile"}">
+                        ${isActive ? "✦ Active" : "Set Active"}
+                    </button>
+                </div>
+            </div>
+            <div class="img2img_profmgr_field">
+                <div class="img2img_profmgr_field_label">Prefix</div>
+                <textarea class="img2img_profmgr_textarea" id="img2img_profmgr_prefix"
+                          placeholder="Text prepended to every prompt with this profile…">${profile.prefix || ""}</textarea>
+            </div>
+            <div class="img2img_profmgr_field">
+                <div class="img2img_profmgr_field_label">Suffix</div>
+                <textarea class="img2img_profmgr_textarea" id="img2img_profmgr_suffix"
+                          placeholder="Text appended to every prompt with this profile…">${profile.suffix || ""}</textarea>
+            </div>
+        `);
+
+        // Auto-save on change
+        let saveTimer;
+        function scheduleSave() {
+            clearTimeout(saveTimer);
+            saveTimer = setTimeout(() => {
+                const newName = $("#img2img_profmgr_name").val().trim();
+                const prefix  = $("#img2img_profmgr_prefix").val();
+                const suffix  = $("#img2img_profmgr_suffix").val();
+
+                // Handle rename
+                if (newName && newName !== profile.name) {
+                    if (s.profiles.some(p => p.name === newName)) {
+                        toastr.warning(`"${newName}" already exists.`);
+                        $("#img2img_profmgr_name").val(profile.name);
+                        return;
+                    }
+                    if (s.active_profile === profile.name) s.active_profile = newName;
+                    if (selectedProfile === profile.name) selectedProfile = newName;
+                    profile.name = newName;
+                    renderProfileList();
+                }
+
+                profile.prefix = prefix;
+                profile.suffix = suffix;
+                saveSettingsDebounced();
+                refreshWidgetState();
+            }, 400);
+        }
+
+        $("#img2img_profmgr_name, #img2img_profmgr_prefix, #img2img_profmgr_suffix")
+            .on("input", scheduleSave);
+
+        // Active badge toggle
+        $("#img2img_profmgr_active_badge").on("click", () => {
+            const s = getSettings();
+            s.active_profile = (s.active_profile === selectedProfile) ? null : selectedProfile;
+            saveSettingsDebounced();
+            refreshWidgetState();
+            renderProfileList();
+            renderEditPanel();
+        });
+    }
+
+    // Build modal
+    $("#img2img_profmgr_overlay").remove();
+    const $overlay = $(`
+        <div id="img2img_profmgr_overlay">
+            <div id="img2img_profmgr_modal">
+                <div id="img2img_profmgr_header">
+                    <div id="img2img_profmgr_title">Enhancement Profiles</div>
+                    <button id="img2img_profmgr_close">✕</button>
+                </div>
+                <div id="img2img_profmgr_body">
+                    <div id="img2img_profmgr_list_col">
+                        <div id="img2img_profmgr_list"></div>
+                        <div id="img2img_profmgr_new_row">
+                            <input type="text" id="img2img_profmgr_new_input" placeholder="Profile name…" />
+                            <button id="img2img_profmgr_new_btn">＋</button>
+                        </div>
+                    </div>
+                    <div id="img2img_profmgr_edit_col"></div>
+                </div>
+            </div>
+        </div>
+    `);
+    $("body").append($overlay);
+
+    const close = () => $("#img2img_profmgr_overlay").remove();
+    $("#img2img_profmgr_close").on("click", close);
+    $("#img2img_profmgr_overlay").on("click", (e) => {
+        if ($(e.target).is("#img2img_profmgr_overlay")) close();
+    });
+
+    // Create new profile
+    function createProfile() {
+        const name = $("#img2img_profmgr_new_input").val().trim();
+        if (!name) return;
+        const s = getSettings();
+        if (s.profiles.some(p => p.name === name)) {
+            toastr.warning(`"${name}" already exists.`); return;
+        }
+        s.profiles.push({ name, prefix: "", suffix: "" });
+        selectedProfile = name;
+        saveSettingsDebounced();
+        refreshWidgetState();
+        $("#img2img_profmgr_new_input").val("");
+        renderProfileList();
+        renderEditPanel();
+    }
+
+    $("#img2img_profmgr_new_btn").on("click", createProfile);
+    $("#img2img_profmgr_new_input").on("keydown", (e) => { if (e.key === "Enter") createProfile(); });
+
+    renderProfileList();
+    renderEditPanel();
 }
 
 // ── Set Manager modal ────────────────────────────────────────────────────────
@@ -1970,5 +2340,5 @@ jQuery(async () => {
         true
     );
 
-    console.log("[Img2Img] Extension ready (v0.15.0). Floating widget active.");
+    console.log("[Img2Img] Extension ready (v0.15.1). Floating widget active.");
 });
